@@ -59,6 +59,33 @@ class StockMove(models.Model):
 
         return True
 
+    def _get_reserved_qty(self, move):
+        """Get the currently reserved quantity for a move in its product UoM.
+        Compatible with Odoo 19 where reserved_availability no longer exists.
+        """
+        # In Odoo 19, we compute reserved qty from move_line_ids
+        if hasattr(move, 'forecast_availability'):
+            # Odoo 19: use move_line_ids to sum reserved quantities
+            reserved = 0.0
+            for ml in move.move_line_ids:
+                if hasattr(ml, 'reserved_uom_qty'):
+                    reserved += ml.product_uom_id._compute_quantity(
+                        ml.reserved_uom_qty, move.product_id.uom_id,
+                        rounding_method='HALF-UP'
+                    )
+                elif hasattr(ml, 'reserved_qty'):
+                    reserved += ml.reserved_qty
+                elif hasattr(ml, 'product_uom_qty'):
+                    reserved += ml.product_uom_id._compute_quantity(
+                        ml.product_uom_qty, move.product_id.uom_id,
+                        rounding_method='HALF-UP'
+                    )
+            return reserved
+        # Fallback for older Odoo versions
+        if hasattr(move, 'reserved_availability'):
+            return move.reserved_availability
+        return 0.0
+
     def _assign_whole_lots(self):
         """Reserve stock using whole-lot strategy.
 
@@ -80,19 +107,18 @@ class StockMove(models.Model):
             rounding = product.uom_id.rounding
 
             # How much do we still need?
-            already_reserved = move.reserved_availability
-            total_demand = move.product_uom_qty
-
-            missing = total_demand - already_reserved
-            if float_is_zero(missing, precision_rounding=rounding):
-                continue
-
-            # Convert missing to product UoM if move uses different UoM
-            need = move.product_uom._compute_quantity(
-                missing, product.uom_id, rounding_method='HALF-UP'
+            # In Odoo 19, product_uom_qty is in the move's UoM
+            total_demand_move_uom = move.product_uom_qty
+            # Convert to product UoM
+            total_demand = move.product_uom._compute_quantity(
+                total_demand_move_uom, product.uom_id, rounding_method='HALF-UP'
             )
 
-            if float_is_zero(need, precision_rounding=rounding):
+            already_reserved = self._get_reserved_qty(move)
+            need = total_demand - already_reserved
+
+            if float_is_zero(need, precision_rounding=rounding) or \
+                    float_compare(need, 0, precision_rounding=rounding) <= 0:
                 continue
 
             # Step 1: Get available lots with their full quantities
@@ -160,11 +186,11 @@ class StockMove(models.Model):
                     )
                     continue
 
-            # Step 4: Update move state
+            # Step 4: Update move state based on total reserved vs demand
             if float_compare(total_reserved, 0, precision_rounding=rounding) > 0:
-                new_reserved = move.reserved_availability
+                new_reserved = self._get_reserved_qty(move)
                 cmp = float_compare(
-                    new_reserved, move.product_uom_qty,
+                    new_reserved, total_demand,
                     precision_rounding=rounding
                 )
                 if cmp >= 0:
