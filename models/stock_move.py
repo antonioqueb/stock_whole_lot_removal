@@ -17,12 +17,10 @@ class StockMove(models.Model):
         if product.tracking not in ('lot', 'serial'):
             return False
 
-        # Check product category first (has priority)
         if product.categ_id.removal_strategy_id and \
                 product.categ_id.removal_strategy_id.method == 'whole_lot':
             return True
 
-        # Then check location hierarchy
         location = self.location_id
         while location:
             if location.removal_strategy_id and \
@@ -31,14 +29,24 @@ class StockMove(models.Model):
             location = location.location_id
         return False
 
+    def _is_backorder_move(self):
+        """
+        Detecta si este move pertenece a un backorder.
+        Un backorder es un picking creado automáticamente por Odoo cuando
+        se valida parcialmente otro picking. Odoo transfiere las reservas
+        pendientes al backorder de forma nativa — NO debemos interferir.
+        """
+        self.ensure_one()
+        if not self.picking_id:
+            return False
+        return bool(self.picking_id.backorder_id)
+
     def _action_assign(self, force_qty=False):
         """Override to intercept moves that use whole_lot removal strategy."""
-        # Allow bypassing our strategy via context
         if self.env.context.get('skip_whole_lot_strategy'):
             return super()._action_assign(force_qty=force_qty)
 
         whole_lot_moves = self.env['stock.move']
-        whole_lot_deferred = self.env['stock.move']
         regular_moves = self.env['stock.move']
 
         for move in self:
@@ -47,9 +55,23 @@ class StockMove(models.Model):
                 regular_moves |= move
                 continue
 
-            # Si tiene origen (es el paso 2 o 3 de una cadena), a veces queremos diferirlo
+            # ══════════════════════════════════════════════════════════════
+            # BACKORDER: Odoo transfiere reservas del picking original al
+            # backorder. No debemos interferir con ese mecanismo nativo.
+            # ══════════════════════════════════════════════════════════════
+            if move._is_backorder_move():
+                _logger.info(
+                    "WholeLot: Move %d belongs to backorder %s (original: %s). "
+                    "Bypassing whole_lot strategy — Odoo handles reservation transfer natively.",
+                    move.id,
+                    move.picking_id.name,
+                    move.picking_id.backorder_id.name
+                )
+                regular_moves |= move
+                continue
+
+            # Si tiene origen (es el paso 2 o 3 de una cadena), diferir
             if move.move_orig_ids and not self.env.context.get('force_whole_lot_assign'):
-                whole_lot_deferred |= move
                 _logger.info(
                     "WholeLot: Deferring reservation for %s (picking %s) - "
                     "has %d origin move(s), states: %s",
@@ -58,8 +80,10 @@ class StockMove(models.Model):
                     len(move.move_orig_ids),
                     [m.state for m in move.move_orig_ids]
                 )
-            else:
-                whole_lot_moves |= move
+                # Deferred moves: no procesamos ahora, se manejan en post-validation
+                continue
+            
+            whole_lot_moves |= move
 
         # Process regular moves with standard Odoo logic
         if regular_moves:
@@ -87,16 +111,12 @@ class StockMove(models.Model):
         """
         Obtiene los IDs de lotes que ya fueron entregados (en moves done)
         para una línea de venta específica.
-        
-        Esto es CRÍTICO para backorders: cuando entregas parcialmente,
-        los lotes ya entregados no deben ser buscados de nuevo en inventario.
         """
         delivered_lot_ids = set()
         
         if not sale_line:
             return delivered_lot_ids
         
-        # Buscar todos los moves DONE de esta SO line
         done_moves = sale_line.move_ids.filtered(lambda m: m.state == 'done')
         
         for move in done_moves:
@@ -140,12 +160,11 @@ class StockMove(models.Model):
                 _logger.info("WholeLot: Need is zero, skipping.")
                 continue
 
-            # 1. Obtener TODOS los lotes físicamente disponibles en la ubicación
+            # 1. Obtener lotes físicamente disponibles
             available_lots = Quant._get_whole_lot_available_quants(
                 product, move.location_id
             )
 
-            # LOG DE DIAGNÓSTICO
             avail_debug = [f"{d['lot_id'].name} ({d['available_qty']:.2f})" for d in available_lots]
             _logger.info(f"WholeLot: Physical Availability at {move.location_id.name} (Count: {len(available_lots)}): {avail_debug}")
 
@@ -157,12 +176,11 @@ class StockMove(models.Model):
                 continue
 
             # ==============================================================================
-            # VINCULACIÓN DINÁMICA: RECUPERACIÓN DE LOTES (SOLUCIÓN BACKORDER)
+            # VINCULACIÓN DINÁMICA: RECUPERACIÓN DE LOTES
             # ==============================================================================
             allowed_lot_ids = set()
             has_restriction = False
             
-            # ── NUEVO: Obtener lotes ya entregados para excluirlos ──
             already_delivered_ids = set()
             if move.sale_line_id:
                 already_delivered_ids = self._get_already_delivered_lot_ids(move.sale_line_id)
@@ -170,7 +188,7 @@ class StockMove(models.Model):
             if move.sale_line_id:
                 sol = move.sale_line_id
                 
-                # FUENTE 1: JSON Breakdown (Más confiable para backorders, no se suele borrar)
+                # FUENTE 1: JSON Breakdown
                 if hasattr(sol, 'x_lot_breakdown_json') and sol.x_lot_breakdown_json:
                     try:
                         json_data = sol.x_lot_breakdown_json
@@ -186,7 +204,7 @@ class StockMove(models.Model):
                     except Exception as e:
                         _logger.warning(f"WholeLot: Failed to parse x_lot_breakdown_json: {e}")
 
-                # FUENTE 2: x_selected_lots (Carrito original, Backup confiable)
+                # FUENTE 2: x_selected_lots
                 if hasattr(sol, 'x_selected_lots') and sol.x_selected_lots:
                     cart_lot_ids = sol.x_selected_lots.mapped('lot_id').ids
                     if cart_lot_ids:
@@ -197,7 +215,7 @@ class StockMove(models.Model):
                         if diff > 0:
                             _logger.info(f"WholeLot: Recovered {diff} additional lots from SO.x_selected_lots")
 
-                # FUENTE 3: lot_ids (Selección actual, puede estar parcial/incompleta en backorders)
+                # FUENTE 3: lot_ids
                 if hasattr(sol, 'lot_ids') and sol.lot_ids:
                     has_restriction = True
                     stone_ids = sol.lot_ids.ids
@@ -208,7 +226,7 @@ class StockMove(models.Model):
                         _logger.info(f"WholeLot: Found {diff} additional lots in SO.lot_ids")
 
             if has_restriction:
-                # ── NUEVO: Excluir lotes ya entregados ──
+                # Excluir lotes ya entregados
                 if already_delivered_ids:
                     before_count = len(allowed_lot_ids)
                     allowed_lot_ids -= already_delivered_ids
@@ -221,7 +239,6 @@ class StockMove(models.Model):
                 
                 _logger.info(f"WholeLot: [RESTRICTION APPLIED] Combined Target Lot IDs: {list(allowed_lot_ids)}")
                 
-                # Filtrar available_lots para dejar SOLO los que están permitidos
                 filtered_lots = []
                 for lot_data in available_lots:
                     if lot_data['lot_id'].id in allowed_lot_ids:
@@ -246,7 +263,7 @@ class StockMove(models.Model):
                 _logger.info("WholeLot: No SO restrictions detected (Open selection).")
             # ==============================================================================
 
-            # 2. Selección Matemática (Algoritmo de optimización)
+            # 2. Selección Matemática
             selected = Quant._whole_lot_select_lots(available_lots, need, rounding)
 
             if not selected:
@@ -343,7 +360,6 @@ class StockMove(models.Model):
             'company_id': move.company_id.id or self.env.company.id,
         }
 
-        # In Odoo 19, stock.move.line uses 'quantity' for reserved qty
         if 'reserved_uom_qty' in self.env['stock.move.line']._fields:
             vals['reserved_uom_qty'] = uom_qty
         else:
