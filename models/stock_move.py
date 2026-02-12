@@ -78,25 +78,15 @@ class StockMove(models.Model):
 
     def _get_reserved_qty(self, move):
         """Get the currently reserved quantity for a move in its product UoM."""
-        if hasattr(move, 'forecast_availability'):
-            reserved = 0.0
-            for ml in move.move_line_ids:
-                if hasattr(ml, 'reserved_uom_qty'):
-                    reserved += ml.product_uom_id._compute_quantity(
-                        ml.reserved_uom_qty, move.product_id.uom_id,
-                        rounding_method='HALF-UP'
-                    )
-                elif hasattr(ml, 'reserved_qty'):
-                    reserved += ml.reserved_qty
-                elif hasattr(ml, 'product_uom_qty'):
-                    reserved += ml.product_uom_id._compute_quantity(
-                        ml.product_uom_qty, move.product_id.uom_id,
-                        rounding_method='HALF-UP'
-                    )
-            return reserved
-        if hasattr(move, 'reserved_availability'):
-            return move.reserved_availability
-        return 0.0
+        reserved = 0.0
+        for ml in move.move_line_ids:
+            # In Odoo 19, stock.move.line uses 'quantity' for the reserved qty
+            ml_qty = ml.quantity if 'quantity' in ml._fields else 0.0
+            reserved += ml.product_uom_id._compute_quantity(
+                ml_qty, move.product_id.uom_id,
+                rounding_method='HALF-UP'
+            )
+        return reserved
 
     def _assign_whole_lots(self):
         """Reserve stock using whole-lot strategy.
@@ -246,10 +236,12 @@ class StockMove(models.Model):
             'company_id': move.company_id.id or self.env.company.id,
         }
 
+        # In Odoo 19, stock.move.line uses 'quantity' for reserved qty
+        # (not 'reserved_uom_qty' which existed in older versions)
         if 'reserved_uom_qty' in self.env['stock.move.line']._fields:
             vals['reserved_uom_qty'] = uom_qty
         else:
-            vals['reserved_uom_qty'] = uom_qty
+            vals['quantity'] = uom_qty
 
         if move.picking_id:
             vals['picking_id'] = move.picking_id.id

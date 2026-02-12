@@ -78,7 +78,7 @@ class StockPicking(models.Model):
                 "move_lines=%d, lots=%s (picking %s)",
                 move.id, move.state,
                 len(move.move_line_ids),
-                [(ml.lot_id.name, ml.reserved_uom_qty)
+                [(ml.lot_id.name, ml.quantity)
                  for ml in move.move_line_ids if ml.lot_id],
                 move.picking_id.name if move.picking_id else 'N/A'
             )
