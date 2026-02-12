@@ -76,13 +76,41 @@ class StockMove(models.Model):
         """Get the currently reserved quantity for a move in its product UoM."""
         reserved = 0.0
         for ml in move.move_line_ids:
-            # In Odoo 19, stock.move.line uses 'quantity' for the reserved qty
             ml_qty = ml.quantity if 'quantity' in ml._fields else 0.0
             reserved += ml.product_uom_id._compute_quantity(
                 ml_qty, move.product_id.uom_id,
                 rounding_method='HALF-UP'
             )
         return reserved
+
+    def _get_already_delivered_lot_ids(self, sale_line):
+        """
+        Obtiene los IDs de lotes que ya fueron entregados (en moves done)
+        para una línea de venta específica.
+        
+        Esto es CRÍTICO para backorders: cuando entregas parcialmente,
+        los lotes ya entregados no deben ser buscados de nuevo en inventario.
+        """
+        delivered_lot_ids = set()
+        
+        if not sale_line:
+            return delivered_lot_ids
+        
+        # Buscar todos los moves DONE de esta SO line
+        done_moves = sale_line.move_ids.filtered(lambda m: m.state == 'done')
+        
+        for move in done_moves:
+            for ml in move.move_line_ids:
+                if ml.lot_id:
+                    delivered_lot_ids.add(ml.lot_id.id)
+        
+        if delivered_lot_ids:
+            _logger.info(
+                "WholeLot: Found %d already-delivered lots for SO Line %s: %s",
+                len(delivered_lot_ids), sale_line.id, list(delivered_lot_ids)
+            )
+        
+        return delivered_lot_ids
 
     def _assign_whole_lots(self):
         """Reserve stock using whole-lot strategy with Dynamic Module Linking and Recovery."""
@@ -134,19 +162,22 @@ class StockMove(models.Model):
             allowed_lot_ids = set()
             has_restriction = False
             
+            # ── NUEVO: Obtener lotes ya entregados para excluirlos ──
+            already_delivered_ids = set()
+            if move.sale_line_id:
+                already_delivered_ids = self._get_already_delivered_lot_ids(move.sale_line_id)
+            
             if move.sale_line_id:
                 sol = move.sale_line_id
                 
                 # FUENTE 1: JSON Breakdown (Más confiable para backorders, no se suele borrar)
                 if hasattr(sol, 'x_lot_breakdown_json') and sol.x_lot_breakdown_json:
                     try:
-                        # El JSON suele ser { "lot_id_int": qty, ... }
                         json_data = sol.x_lot_breakdown_json
                         if isinstance(json_data, str):
                             json_data = json.loads(json_data)
                         
                         if isinstance(json_data, dict):
-                            # Extraer keys que sean numéricas
                             json_ids = [int(k) for k in json_data.keys() if k.isdigit()]
                             if json_ids:
                                 has_restriction = True
@@ -157,7 +188,6 @@ class StockMove(models.Model):
 
                 # FUENTE 2: x_selected_lots (Carrito original, Backup confiable)
                 if hasattr(sol, 'x_selected_lots') and sol.x_selected_lots:
-                    # Mapear Quants -> Lots
                     cart_lot_ids = sol.x_selected_lots.mapped('lot_id').ids
                     if cart_lot_ids:
                         has_restriction = True
@@ -178,6 +208,17 @@ class StockMove(models.Model):
                         _logger.info(f"WholeLot: Found {diff} additional lots in SO.lot_ids")
 
             if has_restriction:
+                # ── NUEVO: Excluir lotes ya entregados ──
+                if already_delivered_ids:
+                    before_count = len(allowed_lot_ids)
+                    allowed_lot_ids -= already_delivered_ids
+                    excluded = before_count - len(allowed_lot_ids)
+                    if excluded > 0:
+                        _logger.info(
+                            "WholeLot: Excluded %d already-delivered lots. "
+                            "Remaining target: %s", excluded, list(allowed_lot_ids)
+                        )
+                
                 _logger.info(f"WholeLot: [RESTRICTION APPLIED] Combined Target Lot IDs: {list(allowed_lot_ids)}")
                 
                 # Filtrar available_lots para dejar SOLO los que están permitidos
@@ -195,8 +236,6 @@ class StockMove(models.Model):
                 )
                 
                 if not available_lots:
-                    # Si después de combinar las 3 fuentes no encontramos nada, es un error real de inventario
-                    # o los lotes no se movieron correctamente a esta ubicación.
                     _logger.error(
                         "WholeLot: CRITICAL - The SO requires specific lots (checked JSON/Cart/Line), "
                         "but NONE of them are physically in the source location. "
