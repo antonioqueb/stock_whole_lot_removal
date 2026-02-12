@@ -83,7 +83,7 @@ class StockMove(models.Model):
         return reserved
 
     def _assign_whole_lots(self):
-        """Reserve stock using whole-lot strategy with Strict SO Filtering."""
+        """Reserve stock using whole-lot strategy with Strict SO Filtering and Recovery Logic."""
         Quant = self.env['stock.quant']
 
         for move in self:
@@ -122,41 +122,55 @@ class StockMove(models.Model):
                 continue
 
             # ==============================================================================
-            # CORRECCIÓN CRÍTICA: FILTRADO POR SALE ORDER
+            # LÓGICA DE FILTRADO Y RECUPERACIÓN DE LOTES (SO FIX)
             # ==============================================================================
-            # Si el movimiento está vinculado a una línea de venta y esa línea tiene lotes específicos
-            if move.sale_line_id and hasattr(move.sale_line_id, 'lot_ids') and move.sale_line_id.lot_ids:
-                allowed_lot_ids = move.sale_line_id.lot_ids.ids
-                _logger.info(f"WholeLot: [RESTRICTION] Move linked to SO Line {move.sale_line_id.id}")
-                _logger.info(f"WholeLot: Allowed Lot IDs (from SO): {allowed_lot_ids}")
+            allowed_lot_ids = set()
+            has_restriction = False
+
+            if move.sale_line_id:
+                # A. Buscar en lot_ids (Estándar de tu módulo Stone Selection)
+                if hasattr(move.sale_line_id, 'lot_ids') and move.sale_line_id.lot_ids:
+                    has_restriction = True
+                    allowed_lot_ids.update(move.sale_line_id.lot_ids.ids)
+                    _logger.info(f"WholeLot: Found {len(move.sale_line_id.lot_ids)} lots in SO.lot_ids")
+
+                # B. Buscar en x_selected_lots (Respaldo del Carrito de Compras)
+                # Esto es CRÍTICO para Backorders, ya que Stone Selection borra los lot_ids entregados,
+                # pero el carrito (x_selected_lots) suele conservar la selección original completa.
+                if hasattr(move.sale_line_id, 'x_selected_lots') and move.sale_line_id.x_selected_lots:
+                    # x_selected_lots es Many2many a stock.quant, obtenemos los stock.lot relacionados
+                    cart_lot_ids = move.sale_line_id.x_selected_lots.mapped('lot_id').ids
+                    if cart_lot_ids:
+                        has_restriction = True
+                        prev_len = len(allowed_lot_ids)
+                        allowed_lot_ids.update(cart_lot_ids)
+                        _logger.info(f"WholeLot: Recovered {len(allowed_lot_ids) - prev_len} lots from SO.x_selected_lots (Cart Backup)")
+
+            if has_restriction:
+                _logger.info(f"WholeLot: [RESTRICTION APPLIED] Total Allowed IDs: {list(allowed_lot_ids)}")
                 
-                # Filtrar available_lots para dejar SOLO los que están en la SO
+                # Filtrar available_lots para dejar SOLO los que están permitidos
                 filtered_lots = []
                 for lot_data in available_lots:
-                    lot_id = lot_data['lot_id'].id
-                    lot_name = lot_data['lot_id'].name
-                    
-                    if lot_id in allowed_lot_ids:
+                    if lot_data['lot_id'].id in allowed_lot_ids:
                         filtered_lots.append(lot_data)
-                    else:
-                        # Log detallado de qué se está ignorando (útil para debug)
-                        # _logger.debug(f"WholeLot: Ignoring lot {lot_name} (ID: {lot_id}) - Not in SO")
-                        pass
                 
                 original_count = len(available_lots)
                 available_lots = filtered_lots
                 
                 _logger.info(
-                    f"WholeLot: Filter applied. Candidates reduced from {original_count} to {len(available_lots)}. "
+                    f"WholeLot: Candidates reduced from {original_count} to {len(available_lots)}. "
                     f"Valid candidates: {[d['lot_id'].name for d in available_lots]}"
                 )
+
+                # PROTECCIÓN FINAL: Si había restricción y nos quedamos sin candidatos,
+                # detenemos el proceso para evitar asignar lotes random.
+                if not available_lots:
+                    _logger.warning("WholeLot: STOPPING - SO restricted lots are not available. Preventing random assignment.")
+                    continue
             else:
                 _logger.info("WholeLot: No SO restrictions detected (Open selection).")
             # ==============================================================================
-
-            if not available_lots:
-                _logger.warning("WholeLot: No valid lots found after applying SO filter.")
-                continue
 
             # 2. Selección Matemática (Algoritmo de optimización)
             selected = Quant._whole_lot_select_lots(available_lots, need, rounding)
@@ -265,6 +279,7 @@ class StockMove(models.Model):
         }
 
         # In Odoo 19, stock.move.line uses 'quantity' for reserved qty
+        # (not 'reserved_uom_qty' which existed in older versions)
         if 'reserved_uom_qty' in self.env['stock.move.line']._fields:
             vals['reserved_uom_qty'] = uom_qty
         else:

@@ -24,7 +24,7 @@ una unidad indivisible.
 
 **Caso de uso principal:**
 Empresas de distribución de piedra natural, mármol, granito donde cada
-lote/placa es una pieza única e indivisible.
+lote/placa es una pieza única e indivisible...
     """,
     'author': 'Alphaqueb Consulting',
     'website': 'https://www.alphaqueb.com',
