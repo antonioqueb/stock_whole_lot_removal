@@ -28,7 +28,7 @@ lote/placa es una pieza única e indivisible.
     """,
     'author': 'Alphaqueb Consulting',
     'website': 'https://www.alphaqueb.com',
-    'depends': ['stock'],
+    'depends': ['stock', 'stock_transit_allocation'],
     'data': [
         'data/product_removal_data.xml',
     ],
