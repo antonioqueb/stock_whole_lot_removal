@@ -46,7 +46,9 @@ class StockMove(models.Model):
                 regular_moves |= move
                 continue
 
-            if move.move_orig_ids:
+            # Si tiene origen (es el paso 2 o 3 de una cadena), a veces queremos diferirlo
+            # Pero si ya estamos en validación post-pick, debemos procesarlo.
+            if move.move_orig_ids and not self.env.context.get('force_whole_lot_assign'):
                 whole_lot_deferred |= move
                 _logger.info(
                     "WholeLot: Deferring reservation for %s (picking %s) - "
@@ -63,7 +65,7 @@ class StockMove(models.Model):
         if regular_moves:
             super(StockMove, regular_moves)._action_assign(force_qty=force_qty)
 
-        # Process whole-lot moves WITHOUT origin (single-step or first step)
+        # Process whole-lot moves
         if whole_lot_moves:
             _logger.info(f"WholeLot: Processing {len(whole_lot_moves)} moves with Whole Lot Strategy...")
             whole_lot_moves._assign_whole_lots()
@@ -83,7 +85,7 @@ class StockMove(models.Model):
         return reserved
 
     def _assign_whole_lots(self):
-        """Reserve stock using whole-lot strategy with Strict SO Filtering and Recovery Logic."""
+        """Reserve stock using whole-lot strategy with Dynamic Module Linking."""
         Quant = self.env['stock.quant']
 
         for move in self:
@@ -101,8 +103,9 @@ class StockMove(models.Model):
             already_reserved = self._get_reserved_qty(move)
             need = total_demand - already_reserved
 
-            _logger.info("=" * 60)
-            _logger.info(f"WholeLot: Move {move.id} [{product.default_code}] - Need: {need:.2f}")
+            _logger.info("=" * 80)
+            _logger.info(f"WholeLot: Move {move.id} [{product.default_code}] @ {move.location_id.display_name}")
+            _logger.info(f"WholeLot: Demand: {total_demand:.2f}, Reserved: {already_reserved:.2f}, Need: {need:.2f}")
 
             if float_is_zero(need, precision_rounding=rounding) or \
                     float_compare(need, 0, precision_rounding=rounding) <= 0:
@@ -114,40 +117,48 @@ class StockMove(models.Model):
                 product, move.location_id
             )
 
+            # LOG DE DIAGNÓSTICO: Ver qué hay realmente en la ubicación
+            avail_debug = [f"{d['lot_id'].name} ({d['available_qty']})" for d in available_lots]
+            _logger.info(f"WholeLot: Physical Availability at {move.location_id.name}: {avail_debug}")
+
             if not available_lots:
-                _logger.info(
-                    "WholeLot: No physical lots available for %s at %s",
+                _logger.warning(
+                    "WholeLot: STOP - No physical lots available for %s at %s",
                     product.display_name, move.location_id.complete_name
                 )
                 continue
 
             # ==============================================================================
-            # LÓGICA DE FILTRADO Y RECUPERACIÓN DE LOTES (SO FIX)
+            # VINCULACIÓN DINÁMICA CON OTROS MÓDULOS (SALE_STONE & SHOPPING_CART)
             # ==============================================================================
             allowed_lot_ids = set()
             has_restriction = False
-
+            
             if move.sale_line_id:
-                # A. Buscar en lot_ids (Estándar de tu módulo Stone Selection)
-                if hasattr(move.sale_line_id, 'lot_ids') and move.sale_line_id.lot_ids:
+                sol = move.sale_line_id
+                
+                # A. Buscar en 'lot_ids' (Módulo: sale_stone_selection)
+                # Este campo suele ser Many2many a 'stock.lot'
+                if hasattr(sol, 'lot_ids') and sol.lot_ids:
                     has_restriction = True
-                    allowed_lot_ids.update(move.sale_line_id.lot_ids.ids)
-                    _logger.info(f"WholeLot: Found {len(move.sale_line_id.lot_ids)} lots in SO.lot_ids")
+                    stone_ids = sol.lot_ids.ids
+                    allowed_lot_ids.update(stone_ids)
+                    _logger.info(f"WholeLot: Found {len(stone_ids)} lots in SO.lot_ids (Stone Selection)")
 
-                # B. Buscar en x_selected_lots (Respaldo del Carrito de Compras)
-                # Esto es CRÍTICO para Backorders, ya que Stone Selection borra los lot_ids entregados,
-                # pero el carrito (x_selected_lots) suele conservar la selección original completa.
-                if hasattr(move.sale_line_id, 'x_selected_lots') and move.sale_line_id.x_selected_lots:
-                    # x_selected_lots es Many2many a stock.quant, obtenemos los stock.lot relacionados
-                    cart_lot_ids = move.sale_line_id.x_selected_lots.mapped('lot_id').ids
-                    if cart_lot_ids:
-                        has_restriction = True
-                        prev_len = len(allowed_lot_ids)
-                        allowed_lot_ids.update(cart_lot_ids)
-                        _logger.info(f"WholeLot: Recovered {len(allowed_lot_ids) - prev_len} lots from SO.x_selected_lots (Cart Backup)")
+                # B. Buscar en 'x_selected_lots' (Módulo: inventory_shopping_cart)
+                # Este campo es Many2many a 'stock.quant'. Debemos obtener los lot_id de esos quants.
+                if hasattr(sol, 'x_selected_lots') and sol.x_selected_lots:
+                    has_restriction = True
+                    # Mapear Quants -> Lots
+                    cart_lot_ids = sol.x_selected_lots.mapped('lot_id').ids
+                    # Eliminar duplicados que ya tengamos
+                    new_lots = set(cart_lot_ids) - allowed_lot_ids
+                    if new_lots:
+                        allowed_lot_ids.update(new_lots)
+                        _logger.info(f"WholeLot: Recovered {len(new_lots)} unique lots from SO.x_selected_lots (Shopping Cart Backup)")
 
             if has_restriction:
-                _logger.info(f"WholeLot: [RESTRICTION APPLIED] Total Allowed IDs: {list(allowed_lot_ids)}")
+                _logger.info(f"WholeLot: [RESTRICTION APPLIED] Target Lot IDs: {list(allowed_lot_ids)}")
                 
                 # Filtrar available_lots para dejar SOLO los que están permitidos
                 filtered_lots = []
@@ -159,14 +170,17 @@ class StockMove(models.Model):
                 available_lots = filtered_lots
                 
                 _logger.info(
-                    f"WholeLot: Candidates reduced from {original_count} to {len(available_lots)}. "
-                    f"Valid candidates: {[d['lot_id'].name for d in available_lots]}"
+                    f"WholeLot: Filter result: {original_count} -> {len(available_lots)} candidates."
                 )
-
-                # PROTECCIÓN FINAL: Si había restricción y nos quedamos sin candidatos,
-                # detenemos el proceso para evitar asignar lotes random.
+                
                 if not available_lots:
-                    _logger.warning("WholeLot: STOPPING - SO restricted lots are not available. Preventing random assignment.")
+                    _logger.error(
+                        "WholeLot: CRITICAL - The SO requires specific lots, but NONE of them are in the source location. "
+                        "Preventing random assignment."
+                    )
+                    # Aquí detenemos para no asignar basura. 
+                    # Si esto pasa en un Backorder, significa que el stock no se movió correctamente al Output 
+                    # o que la SO pide algo que ya no existe.
                     continue
             else:
                 _logger.info("WholeLot: No SO restrictions detected (Open selection).")
@@ -177,9 +191,8 @@ class StockMove(models.Model):
 
             if not selected:
                 _logger.info(
-                    "WholeLot: Math logic could not select complete lots for demand %.2f. "
-                    "Available Candidates: %s",
-                    need, [(d['lot_id'].name, d['available_qty']) for d in available_lots]
+                    "WholeLot: Math logic could not select complete lots for demand %.2f. Candidates: %s",
+                    need, [d['lot_id'].name for d in available_lots]
                 )
                 continue
 
@@ -225,13 +238,12 @@ class StockMove(models.Model):
                         )
                     else:
                         _logger.warning(
-                            "WholeLot: FAILED - Reservation had no effect for lot '%s' "
-                            "(before=%.2f, after=%.2f)",
-                            lot.name, reserved_before, reserved_after
+                            "WholeLot: FAILED - Reservation had no effect for lot '%s'. "
+                            "Maybe reserved by another user?", lot.name
                         )
                 except Exception as e:
                     _logger.error(
-                        "WholeLot: CRITICAL ERROR reserving lot '%s': %s",
+                        "WholeLot: EXCEPTION reserving lot '%s': %s",
                         lot.name if lot else 'N/A', str(e)
                     )
                     continue
@@ -249,15 +261,8 @@ class StockMove(models.Model):
                 elif move.state != 'partially_available':
                     move.write({'state': 'partially_available'})
                     _logger.info("WholeLot: Move state updated to PARTIALLY AVAILABLE")
-
-                shortfall = need - total_reserved
-                if float_compare(shortfall, 0, precision_rounding=rounding) > 0:
-                    _logger.info(
-                        "WholeLot: Fulfillment Summary: %.2f reserved / %.2f needed. "
-                        "Shortfall: %.2f", total_reserved, need, shortfall
-                    )
             
-            _logger.info("=" * 60)
+            _logger.info("=" * 80)
 
     def _create_whole_lot_move_line(self, move, lot, quantity, product):
         """Create a stock.move.line for a whole-lot reservation."""
@@ -279,7 +284,6 @@ class StockMove(models.Model):
         }
 
         # In Odoo 19, stock.move.line uses 'quantity' for reserved qty
-        # (not 'reserved_uom_qty' which existed in older versions)
         if 'reserved_uom_qty' in self.env['stock.move.line']._fields:
             vals['reserved_uom_qty'] = uom_qty
         else:
