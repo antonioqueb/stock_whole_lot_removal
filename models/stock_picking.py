@@ -329,43 +329,4 @@ class StockPicking(models.Model):
                      for ml in move.move_line_ids if ml.lot_id]
                 )
 
-    def _get_all_sale_lots_with_qty(self):
-        """
-        Retorna TODOS los lotes de la venta con su cantidad,
-        buscando en todos los moves/pickings + fallback a lot_ids.
-        Para uso en reportes.
-        """
-        self.ensure_one()
-        
-        # 1. Buscar en TODOS los stock.move.line vinculados
-        move_lines = self.env['stock.move.line'].search([
-            ('move_id.sale_line_id', '=', self.id),
-            ('lot_id', '!=', False),
-        ])
-        
-        if move_lines:
-            lot_data = {}
-            for ml in move_lines:
-                lot = ml.lot_id
-                if lot.id not in lot_data:
-                    lot_data[lot.id] = {'lot': lot, 'quantity': 0.0}
-                lot_data[lot.id]['quantity'] += ml.quantity or ml.reserved_uom_qty or 0.0
-            return list(lot_data.values())
-        
-        # 2. Fallback: lot_ids (pre-confirmación o sin moves aún)
-        if self.lot_ids:
-            result = []
-            for lot in self.lot_ids:
-                quant = self.env['stock.quant'].search([
-                    ('lot_id', '=', lot.id),
-                    ('product_id', '=', self.product_id.id),
-                    ('location_id.usage', '=', 'internal'),
-                    ('quantity', '>', 0)
-                ], limit=1)
-                result.append({
-                    'lot': lot,
-                    'quantity': quant.quantity if quant else (lot.x_alto * lot.x_ancho if lot.x_alto and lot.x_ancho else 0.0),
-                })
-            return result
-        
-        return []
+    
