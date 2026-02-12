@@ -224,12 +224,14 @@ class StockPicking(models.Model):
                     )
 
                     # Determine how much to assign
+                    # Always use lot_total_qty as the real quantity of the lot
+                    reserve_qty = lot_total_qty
+
                     if float_compare(lot_available_qty, 0, precision_rounding=rounding) > 0:
                         # Available: reserve it normally
-                        reserve_qty = lot_available_qty
                         try:
                             Quant._update_reserved_quantity(
-                                product, move.location_id, reserve_qty,
+                                product, move.location_id, lot_available_qty,
                                 lot_id=lot, strict=False
                             )
                         except Exception as e:
@@ -238,10 +240,10 @@ class StockPicking(models.Model):
                                 lot.name, e
                             )
                             continue
-                    elif float_compare(lot_reserved_qty, 0, precision_rounding=rounding) > 0:
-                        # Already reserved (by Odoo's backorder transfer) — use it
-                        reserve_qty = lot_reserved_qty
-                        # Don't call _update_reserved_quantity, Odoo already did it
+                    elif float_compare(lot_total_qty, 0, precision_rounding=rounding) > 0:
+                        # Already reserved (by Odoo's backorder transfer) — 
+                        # just create the move_line, don't double-reserve
+                        pass
                     else:
                         _logger.warning(
                             "WholeLot: Lot %s has zero quantity, skipping",
