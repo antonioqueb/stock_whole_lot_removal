@@ -31,12 +31,7 @@ class StockMove(models.Model):
         return False
 
     def _action_assign(self, force_qty=False):
-        """Override to intercept moves that use whole_lot removal strategy.
-
-        Context key 'skip_whole_lot_strategy' bypasses this override entirely,
-        used by post-validation propagation to let standard Odoo handle
-        reservation of quants that were already moved by the PICK step.
-        """
+        """Override to intercept moves that use whole_lot removal strategy."""
         # Allow bypassing our strategy via context
         if self.env.context.get('skip_whole_lot_strategy'):
             return super()._action_assign(force_qty=force_qty)
@@ -70,9 +65,8 @@ class StockMove(models.Model):
 
         # Process whole-lot moves WITHOUT origin (single-step or first step)
         if whole_lot_moves:
+            _logger.info(f"WholeLot: Processing {len(whole_lot_moves)} moves with Whole Lot Strategy...")
             whole_lot_moves._assign_whole_lots()
-
-        # Deferred moves: handled by button_validate post-hook in stock_picking.py
 
         return True
 
@@ -89,16 +83,7 @@ class StockMove(models.Model):
         return reserved
 
     def _assign_whole_lots(self):
-        """Reserve stock using whole-lot strategy.
-
-        For each move, we:
-        1. Find all available quants grouped by lot
-        2. Select only complete lots that fit the demand
-        3. Reserve via _update_reserved_quantity and create move lines
-        4. Update move state accordingly
-
-        CRITICAL: We never split a lot. Each lot is either fully reserved or not at all.
-        """
+        """Reserve stock using whole-lot strategy with Strict SO Filtering."""
         Quant = self.env['stock.quant']
 
         for move in self:
@@ -116,32 +101,75 @@ class StockMove(models.Model):
             already_reserved = self._get_reserved_qty(move)
             need = total_demand - already_reserved
 
+            _logger.info("=" * 60)
+            _logger.info(f"WholeLot: Move {move.id} [{product.default_code}] - Need: {need:.2f}")
+
             if float_is_zero(need, precision_rounding=rounding) or \
                     float_compare(need, 0, precision_rounding=rounding) <= 0:
+                _logger.info("WholeLot: Need is zero, skipping.")
                 continue
 
+            # 1. Obtener TODOS los lotes físicamente disponibles en la ubicación
             available_lots = Quant._get_whole_lot_available_quants(
                 product, move.location_id
             )
 
             if not available_lots:
                 _logger.info(
-                    "WholeLot: No lots available for %s at %s",
+                    "WholeLot: No physical lots available for %s at %s",
                     product.display_name, move.location_id.complete_name
                 )
                 continue
 
+            # ==============================================================================
+            # CORRECCIÓN CRÍTICA: FILTRADO POR SALE ORDER
+            # ==============================================================================
+            # Si el movimiento está vinculado a una línea de venta y esa línea tiene lotes específicos
+            if move.sale_line_id and hasattr(move.sale_line_id, 'lot_ids') and move.sale_line_id.lot_ids:
+                allowed_lot_ids = move.sale_line_id.lot_ids.ids
+                _logger.info(f"WholeLot: [RESTRICTION] Move linked to SO Line {move.sale_line_id.id}")
+                _logger.info(f"WholeLot: Allowed Lot IDs (from SO): {allowed_lot_ids}")
+                
+                # Filtrar available_lots para dejar SOLO los que están en la SO
+                filtered_lots = []
+                for lot_data in available_lots:
+                    lot_id = lot_data['lot_id'].id
+                    lot_name = lot_data['lot_id'].name
+                    
+                    if lot_id in allowed_lot_ids:
+                        filtered_lots.append(lot_data)
+                    else:
+                        # Log detallado de qué se está ignorando (útil para debug)
+                        # _logger.debug(f"WholeLot: Ignoring lot {lot_name} (ID: {lot_id}) - Not in SO")
+                        pass
+                
+                original_count = len(available_lots)
+                available_lots = filtered_lots
+                
+                _logger.info(
+                    f"WholeLot: Filter applied. Candidates reduced from {original_count} to {len(available_lots)}. "
+                    f"Valid candidates: {[d['lot_id'].name for d in available_lots]}"
+                )
+            else:
+                _logger.info("WholeLot: No SO restrictions detected (Open selection).")
+            # ==============================================================================
+
+            if not available_lots:
+                _logger.warning("WholeLot: No valid lots found after applying SO filter.")
+                continue
+
+            # 2. Selección Matemática (Algoritmo de optimización)
             selected = Quant._whole_lot_select_lots(available_lots, need, rounding)
 
             if not selected:
                 _logger.info(
-                    "WholeLot: Cannot select complete lots for demand %.2f %s of %s. "
-                    "Available: %s",
-                    need, product.uom_id.name, product.display_name,
-                    [(d['lot_id'].name, d['available_qty']) for d in available_lots]
+                    "WholeLot: Math logic could not select complete lots for demand %.2f. "
+                    "Available Candidates: %s",
+                    need, [(d['lot_id'].name, d['available_qty']) for d in available_lots]
                 )
                 continue
 
+            # 3. Ejecutar Reserva
             total_reserved = 0.0
             for lot_data in selected:
                 lot = lot_data['lot_id']
@@ -151,8 +179,6 @@ class StockMove(models.Model):
                     continue
 
                 try:
-                    # In Odoo 19, _update_reserved_quantity returns None
-                    # but updates quants directly. We verify by re-reading.
                     reserved_before = sum(
                         q.reserved_quantity
                         for q in Quant._gather(
@@ -180,23 +206,23 @@ class StockMove(models.Model):
                         )
                         total_reserved += actual_reserved
                         _logger.info(
-                            "WholeLot: Reserved lot '%s' (%.2f %s) for %s",
-                            lot.name, actual_reserved, product.uom_id.name,
-                            product.display_name
+                            "WholeLot: SUCCESS - Reserved lot '%s' (%.2f %s)",
+                            lot.name, actual_reserved, product.uom_id.name
                         )
                     else:
                         _logger.warning(
-                            "WholeLot: Reservation had no effect for lot '%s' "
+                            "WholeLot: FAILED - Reservation had no effect for lot '%s' "
                             "(before=%.2f, after=%.2f)",
                             lot.name, reserved_before, reserved_after
                         )
                 except Exception as e:
-                    _logger.warning(
-                        "WholeLot: Failed to reserve lot '%s' for %s: %s",
-                        lot.name if lot else 'N/A', product.display_name, str(e)
+                    _logger.error(
+                        "WholeLot: CRITICAL ERROR reserving lot '%s': %s",
+                        lot.name if lot else 'N/A', str(e)
                     )
                     continue
 
+            # 4. Actualizar Estado del Movimiento
             if float_compare(total_reserved, 0, precision_rounding=rounding) > 0:
                 new_reserved = self._get_reserved_qty(move)
                 cmp = float_compare(
@@ -205,17 +231,19 @@ class StockMove(models.Model):
                 )
                 if cmp >= 0:
                     move.write({'state': 'assigned'})
+                    _logger.info("WholeLot: Move state updated to ASSIGNED")
                 elif move.state != 'partially_available':
                     move.write({'state': 'partially_available'})
+                    _logger.info("WholeLot: Move state updated to PARTIALLY AVAILABLE")
 
                 shortfall = need - total_reserved
                 if float_compare(shortfall, 0, precision_rounding=rounding) > 0:
                     _logger.info(
-                        "WholeLot: Partially fulfilled %.2f/%.2f %s for %s. "
-                        "%.2f %s pending manual selection.",
-                        total_reserved, need, product.uom_id.name,
-                        product.display_name, shortfall, product.uom_id.name
+                        "WholeLot: Fulfillment Summary: %.2f reserved / %.2f needed. "
+                        "Shortfall: %.2f", total_reserved, need, shortfall
                     )
+            
+            _logger.info("=" * 60)
 
     def _create_whole_lot_move_line(self, move, lot, quantity, product):
         """Create a stock.move.line for a whole-lot reservation."""
@@ -237,7 +265,6 @@ class StockMove(models.Model):
         }
 
         # In Odoo 19, stock.move.line uses 'quantity' for reserved qty
-        # (not 'reserved_uom_qty' which existed in older versions)
         if 'reserved_uom_qty' in self.env['stock.move.line']._fields:
             vals['reserved_uom_qty'] = uom_qty
         else:
