@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 import logging
+import json
 from odoo import models, api, _
 from odoo.tools import float_compare, float_is_zero
 
@@ -47,7 +48,6 @@ class StockMove(models.Model):
                 continue
 
             # Si tiene origen (es el paso 2 o 3 de una cadena), a veces queremos diferirlo
-            # Pero si ya estamos en validación post-pick, debemos procesarlo.
             if move.move_orig_ids and not self.env.context.get('force_whole_lot_assign'):
                 whole_lot_deferred |= move
                 _logger.info(
@@ -85,7 +85,7 @@ class StockMove(models.Model):
         return reserved
 
     def _assign_whole_lots(self):
-        """Reserve stock using whole-lot strategy with Dynamic Module Linking."""
+        """Reserve stock using whole-lot strategy with Dynamic Module Linking and Recovery."""
         Quant = self.env['stock.quant']
 
         for move in self:
@@ -117,9 +117,9 @@ class StockMove(models.Model):
                 product, move.location_id
             )
 
-            # LOG DE DIAGNÓSTICO: Ver qué hay realmente en la ubicación
-            avail_debug = [f"{d['lot_id'].name} ({d['available_qty']})" for d in available_lots]
-            _logger.info(f"WholeLot: Physical Availability at {move.location_id.name}: {avail_debug}")
+            # LOG DE DIAGNÓSTICO
+            avail_debug = [f"{d['lot_id'].name} ({d['available_qty']:.2f})" for d in available_lots]
+            _logger.info(f"WholeLot: Physical Availability at {move.location_id.name} (Count: {len(available_lots)}): {avail_debug}")
 
             if not available_lots:
                 _logger.warning(
@@ -129,7 +129,7 @@ class StockMove(models.Model):
                 continue
 
             # ==============================================================================
-            # VINCULACIÓN DINÁMICA CON OTROS MÓDULOS (SALE_STONE & SHOPPING_CART)
+            # VINCULACIÓN DINÁMICA: RECUPERACIÓN DE LOTES (SOLUCIÓN BACKORDER)
             # ==============================================================================
             allowed_lot_ids = set()
             has_restriction = False
@@ -137,28 +137,48 @@ class StockMove(models.Model):
             if move.sale_line_id:
                 sol = move.sale_line_id
                 
-                # A. Buscar en 'lot_ids' (Módulo: sale_stone_selection)
-                # Este campo suele ser Many2many a 'stock.lot'
+                # FUENTE 1: JSON Breakdown (Más confiable para backorders, no se suele borrar)
+                if hasattr(sol, 'x_lot_breakdown_json') and sol.x_lot_breakdown_json:
+                    try:
+                        # El JSON suele ser { "lot_id_int": qty, ... }
+                        json_data = sol.x_lot_breakdown_json
+                        if isinstance(json_data, str):
+                            json_data = json.loads(json_data)
+                        
+                        if isinstance(json_data, dict):
+                            # Extraer keys que sean numéricas
+                            json_ids = [int(k) for k in json_data.keys() if k.isdigit()]
+                            if json_ids:
+                                has_restriction = True
+                                allowed_lot_ids.update(json_ids)
+                                _logger.info(f"WholeLot: Recovered {len(json_ids)} lots from SO.x_lot_breakdown_json")
+                    except Exception as e:
+                        _logger.warning(f"WholeLot: Failed to parse x_lot_breakdown_json: {e}")
+
+                # FUENTE 2: x_selected_lots (Carrito original, Backup confiable)
+                if hasattr(sol, 'x_selected_lots') and sol.x_selected_lots:
+                    # Mapear Quants -> Lots
+                    cart_lot_ids = sol.x_selected_lots.mapped('lot_id').ids
+                    if cart_lot_ids:
+                        has_restriction = True
+                        prev_len = len(allowed_lot_ids)
+                        allowed_lot_ids.update(cart_lot_ids)
+                        diff = len(allowed_lot_ids) - prev_len
+                        if diff > 0:
+                            _logger.info(f"WholeLot: Recovered {diff} additional lots from SO.x_selected_lots")
+
+                # FUENTE 3: lot_ids (Selección actual, puede estar parcial/incompleta en backorders)
                 if hasattr(sol, 'lot_ids') and sol.lot_ids:
                     has_restriction = True
                     stone_ids = sol.lot_ids.ids
+                    prev_len = len(allowed_lot_ids)
                     allowed_lot_ids.update(stone_ids)
-                    _logger.info(f"WholeLot: Found {len(stone_ids)} lots in SO.lot_ids (Stone Selection)")
-
-                # B. Buscar en 'x_selected_lots' (Módulo: inventory_shopping_cart)
-                # Este campo es Many2many a 'stock.quant'. Debemos obtener los lot_id de esos quants.
-                if hasattr(sol, 'x_selected_lots') and sol.x_selected_lots:
-                    has_restriction = True
-                    # Mapear Quants -> Lots
-                    cart_lot_ids = sol.x_selected_lots.mapped('lot_id').ids
-                    # Eliminar duplicados que ya tengamos
-                    new_lots = set(cart_lot_ids) - allowed_lot_ids
-                    if new_lots:
-                        allowed_lot_ids.update(new_lots)
-                        _logger.info(f"WholeLot: Recovered {len(new_lots)} unique lots from SO.x_selected_lots (Shopping Cart Backup)")
+                    diff = len(allowed_lot_ids) - prev_len
+                    if diff > 0:
+                        _logger.info(f"WholeLot: Found {diff} additional lots in SO.lot_ids")
 
             if has_restriction:
-                _logger.info(f"WholeLot: [RESTRICTION APPLIED] Target Lot IDs: {list(allowed_lot_ids)}")
+                _logger.info(f"WholeLot: [RESTRICTION APPLIED] Combined Target Lot IDs: {list(allowed_lot_ids)}")
                 
                 # Filtrar available_lots para dejar SOLO los que están permitidos
                 filtered_lots = []
@@ -170,17 +190,18 @@ class StockMove(models.Model):
                 available_lots = filtered_lots
                 
                 _logger.info(
-                    f"WholeLot: Filter result: {original_count} -> {len(available_lots)} candidates."
+                    f"WholeLot: Filter result: {original_count} -> {len(available_lots)} candidates. "
+                    f"Valid candidates: {[d['lot_id'].name for d in available_lots]}"
                 )
                 
                 if not available_lots:
+                    # Si después de combinar las 3 fuentes no encontramos nada, es un error real de inventario
+                    # o los lotes no se movieron correctamente a esta ubicación.
                     _logger.error(
-                        "WholeLot: CRITICAL - The SO requires specific lots, but NONE of them are in the source location. "
+                        "WholeLot: CRITICAL - The SO requires specific lots (checked JSON/Cart/Line), "
+                        "but NONE of them are physically in the source location. "
                         "Preventing random assignment."
                     )
-                    # Aquí detenemos para no asignar basura. 
-                    # Si esto pasa en un Backorder, significa que el stock no se movió correctamente al Output 
-                    # o que la SO pide algo que ya no existe.
                     continue
             else:
                 _logger.info("WholeLot: No SO restrictions detected (Open selection).")
