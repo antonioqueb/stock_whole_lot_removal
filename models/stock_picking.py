@@ -216,16 +216,35 @@ class StockPicking(models.Model):
                     lot_reserved_qty = sum(q.reserved_quantity for q in quants)
                     lot_available_qty = lot_total_qty - lot_reserved_qty
 
+                    # For quants with quantity > 0 specifically (ignore residual quants)
+                    positive_quants = quants.filtered(lambda q: q.quantity > 0)
+                    lot_real_qty = sum(q.quantity for q in positive_quants) if positive_quants else 0.0
+
                     _logger.info(
                         "WholeLot: Lot %s quant info - total: %.2f, "
-                        "reserved: %.2f, available: %.2f",
+                        "reserved: %.2f, available: %.2f, real_qty: %.2f, "
+                        "quant_count: %d",
                         lot.name, lot_total_qty, lot_reserved_qty,
-                        lot_available_qty
+                        lot_available_qty, lot_real_qty, len(quants)
                     )
 
-                    # Determine how much to assign
-                    # Always use lot_total_qty as the real quantity of the lot
-                    reserve_qty = lot_total_qty
+                    # Determine the actual quantity of this lot
+                    # Priority: real_qty (from positive quants) > lot_total_qty > lot_reserved_qty
+                    if float_compare(lot_real_qty, 0, precision_rounding=rounding) > 0:
+                        reserve_qty = lot_real_qty
+                    elif float_compare(lot_total_qty, 0, precision_rounding=rounding) > 0:
+                        reserve_qty = lot_total_qty
+                    elif float_compare(lot_reserved_qty, 0, precision_rounding=rounding) > 0:
+                        # Quant has quantity=0 but reserved>0 — this is a residual
+                        # quant from Odoo's backorder transfer. The reservation IS
+                        # ours. Use reserved_qty as the lot quantity.
+                        reserve_qty = lot_reserved_qty
+                    else:
+                        _logger.warning(
+                            "WholeLot: Lot %s has zero quantity everywhere, skipping",
+                            lot.name
+                        )
+                        continue
 
                     if float_compare(lot_available_qty, 0, precision_rounding=rounding) > 0:
                         # Available: reserve it normally
@@ -240,16 +259,15 @@ class StockPicking(models.Model):
                                 lot.name, e
                             )
                             continue
-                    elif float_compare(lot_total_qty, 0, precision_rounding=rounding) > 0:
-                        # Already reserved (by Odoo's backorder transfer) — 
-                        # just create the move_line, don't double-reserve
-                        pass
                     else:
-                        _logger.warning(
-                            "WholeLot: Lot %s has zero quantity, skipping",
-                            lot.name
+                        # Already reserved (by Odoo's backorder transfer) or
+                        # residual quant — just create the move_line
+                        _logger.info(
+                            "WholeLot: Lot %s already reserved (backorder transfer), "
+                            "creating move_line with qty %.2f",
+                            lot.name, reserve_qty
                         )
-                        continue
+                        pass
 
                     # Create move line
                     uom_qty = product.uom_id._compute_quantity(
