@@ -37,35 +37,60 @@ class StockMove(models.Model):
         - whole_lot moves: handled by our custom logic
         - regular moves: handled by Odoo's standard logic
 
-        This ensures minimal interference with the standard Odoo flow.
+        For whole_lot moves that have origin moves (multi-step), we SKIP
+        reservation here because quants may not have arrived yet. Those
+        will be handled by _propagate_lots_from_pick() after validation.
         """
         whole_lot_moves = self.env['stock.move']
+        whole_lot_deferred = self.env['stock.move']
         regular_moves = self.env['stock.move']
 
         for move in self:
-            if move.state in ('confirmed', 'partially_available', 'waiting') \
-                    and move._should_use_whole_lot_strategy():
-                whole_lot_moves |= move
-            else:
+            if move.state not in ('confirmed', 'partially_available', 'waiting') \
+                    or not move._should_use_whole_lot_strategy():
                 regular_moves |= move
+                continue
+
+            # Check if this move has origin moves that are being validated
+            # (multi-step scenario: PICK → OUT)
+            has_pending_origins = any(
+                orig.state not in ('done', 'cancel')
+                for orig in move.move_orig_ids
+            ) if move.move_orig_ids else False
+
+            has_done_origins = any(
+                orig.state == 'done'
+                for orig in move.move_orig_ids
+            ) if move.move_orig_ids else False
+
+            if move.move_orig_ids and (has_pending_origins or has_done_origins):
+                # Defer: will be handled after PICK validation
+                whole_lot_deferred |= move
+                _logger.info(
+                    "WholeLot: Deferring reservation for %s (picking %s) - "
+                    "has origin moves (pending=%s, done=%s)",
+                    move.product_id.display_name,
+                    move.picking_id.name if move.picking_id else 'N/A',
+                    has_pending_origins, has_done_origins
+                )
+            else:
+                whole_lot_moves |= move
 
         # Process regular moves with standard Odoo logic
         if regular_moves:
             super(StockMove, regular_moves)._action_assign(force_qty=force_qty)
 
-        # Process whole-lot moves with our custom logic
+        # Process whole-lot moves WITHOUT origin (single-step or first step)
         if whole_lot_moves:
             whole_lot_moves._assign_whole_lots()
+
+        # Deferred moves: do nothing now, they'll be assigned after PICK validates
 
         return True
 
     def _get_reserved_qty(self, move):
-        """Get the currently reserved quantity for a move in its product UoM.
-        Compatible with Odoo 19 where reserved_availability no longer exists.
-        """
-        # In Odoo 19, we compute reserved qty from move_line_ids
+        """Get the currently reserved quantity for a move in its product UoM."""
         if hasattr(move, 'forecast_availability'):
-            # Odoo 19: use move_line_ids to sum reserved quantities
             reserved = 0.0
             for ml in move.move_line_ids:
                 if hasattr(ml, 'reserved_uom_qty'):
@@ -81,56 +106,18 @@ class StockMove(models.Model):
                         rounding_method='HALF-UP'
                     )
             return reserved
-        # Fallback for older Odoo versions
         if hasattr(move, 'reserved_availability'):
             return move.reserved_availability
         return 0.0
-
-    def _get_lots_from_origin_moves(self, move):
-        """Get lot assignments from the preceding move (PICK step).
-        
-        In a multi-step flow (PICK → OUT), the OUT move has move_orig_ids
-        pointing to the PICK move. If the PICK move was already validated
-        and had lots assigned, we can propagate those same lots to the OUT.
-        
-        Returns:
-            list of dicts with 'lot_id' and 'qty', or empty list
-        """
-        lot_assignments = []
-        
-        if not move.move_orig_ids:
-            return lot_assignments
-        
-        for orig_move in move.move_orig_ids:
-            if orig_move.state != 'done':
-                continue
-            for ml in orig_move.move_line_ids:
-                if ml.lot_id and float_compare(
-                    ml.quantity, 0,
-                    precision_rounding=move.product_id.uom_id.rounding
-                ) > 0:
-                    lot_assignments.append({
-                        'lot_id': ml.lot_id,
-                        'qty': ml.quantity,
-                    })
-        
-        _logger.info(
-            "WholeLot: Found %d lot(s) from origin moves for %s: %s",
-            len(lot_assignments),
-            move.product_id.display_name,
-            [(la['lot_id'].name, la['qty']) for la in lot_assignments]
-        )
-        return lot_assignments
 
     def _assign_whole_lots(self):
         """Reserve stock using whole-lot strategy.
 
         For each move, we:
-        1. Check if lots can be propagated from a preceding move (multi-step)
-        2. If not, find all available quants grouped by lot
-        3. Select only complete lots that fit the demand
-        4. Create move lines for each selected lot
-        5. Update move state accordingly
+        1. Find all available quants grouped by lot
+        2. Select only complete lots that fit the demand
+        3. Create move lines for each selected lot
+        4. Update move state accordingly
 
         CRITICAL: We never split a lot. Each lot is either fully reserved or not at all.
         """
@@ -143,7 +130,6 @@ class StockMove(models.Model):
             product = move.product_id
             rounding = product.uom_id.rounding
 
-            # How much do we still need?
             total_demand_move_uom = move.product_uom_qty
             total_demand = move.product_uom._compute_quantity(
                 total_demand_move_uom, product.uom_id, rounding_method='HALF-UP'
@@ -156,84 +142,7 @@ class StockMove(models.Model):
                     float_compare(need, 0, precision_rounding=rounding) <= 0:
                 continue
 
-            # ============================================================
-            # STEP 0: Try to propagate lots from origin moves (multi-step)
-            # ============================================================
-            origin_lots = self._get_lots_from_origin_moves(move)
-            if origin_lots:
-                _logger.info(
-                    "WholeLot: Propagating %d lot(s) from origin move to %s (picking %s)",
-                    len(origin_lots),
-                    product.display_name,
-                    move.picking_id.name if move.picking_id else 'N/A'
-                )
-                total_reserved = 0.0
-                for lot_data in origin_lots:
-                    lot = lot_data['lot_id']
-                    qty = lot_data['qty']
-
-                    if float_compare(qty, 0, precision_rounding=rounding) <= 0:
-                        continue
-
-                    # Verify the lot actually has available stock in the source location
-                    quants = Quant._gather(
-                        product, move.location_id, lot_id=lot, strict=False
-                    )
-                    available = sum(q.quantity - q.reserved_quantity for q in quants)
-
-                    if float_compare(available, qty, precision_rounding=rounding) < 0:
-                        # Use whatever is available (should be the full qty normally)
-                        if float_compare(available, 0, precision_rounding=rounding) <= 0:
-                            _logger.warning(
-                                "WholeLot: Lot %s has no available qty at %s, skipping",
-                                lot.name, move.location_id.complete_name
-                            )
-                            continue
-                        qty = available
-
-                    try:
-                        reserved = Quant._update_reserved_quantity(
-                            product, move.location_id, qty,
-                            lot_id=lot, strict=False
-                        )
-
-                        if isinstance(reserved, (int, float)):
-                            actual_reserved = reserved
-                        else:
-                            actual_reserved = sum(r[1] for r in reserved) if reserved else 0
-
-                        if float_compare(actual_reserved, 0, precision_rounding=rounding) > 0:
-                            self._create_whole_lot_move_line(
-                                move, lot, actual_reserved, product
-                            )
-                            total_reserved += actual_reserved
-                            _logger.info(
-                                "WholeLot: Propagated lot '%s' (%.2f %s) to picking %s",
-                                lot.name, actual_reserved, product.uom_id.name,
-                                move.picking_id.name if move.picking_id else 'N/A'
-                            )
-                    except Exception as e:
-                        _logger.warning(
-                            "WholeLot: Failed to propagate lot '%s': %s",
-                            lot.name, str(e)
-                        )
-                        continue
-
-                # Update move state
-                if float_compare(total_reserved, 0, precision_rounding=rounding) > 0:
-                    new_reserved = self._get_reserved_qty(move)
-                    if float_compare(new_reserved, total_demand, precision_rounding=rounding) >= 0:
-                        move.write({'state': 'assigned'})
-                    elif move.state != 'partially_available':
-                        move.write({'state': 'partially_available'})
-
-                # If we propagated something, skip the regular lot selection
-                if float_compare(total_reserved, 0, precision_rounding=rounding) > 0:
-                    continue
-
-            # ============================================================
-            # STEP 1: Standard whole-lot selection (no origin moves)
-            # ============================================================
+            # Get available lots
             available_lots = Quant._get_whole_lot_available_quants(
                 product, move.location_id
             )
@@ -245,7 +154,7 @@ class StockMove(models.Model):
                 )
                 continue
 
-            # Step 2: Select which complete lots to reserve
+            # Select which complete lots to reserve
             selected = Quant._whole_lot_select_lots(available_lots, need, rounding)
 
             if not selected:
@@ -257,7 +166,7 @@ class StockMove(models.Model):
                 )
                 continue
 
-            # Step 3: Reserve each complete lot
+            # Reserve each complete lot
             total_reserved = 0.0
             for lot_data in selected:
                 lot = lot_data['lot_id']
@@ -294,7 +203,7 @@ class StockMove(models.Model):
                     )
                     continue
 
-            # Step 4: Update move state
+            # Update move state
             if float_compare(total_reserved, 0, precision_rounding=rounding) > 0:
                 new_reserved = self._get_reserved_qty(move)
                 cmp = float_compare(
@@ -314,6 +223,123 @@ class StockMove(models.Model):
                         total_reserved, need, product.uom_id.name,
                         product.display_name, shortfall, product.uom_id.name
                     )
+
+    def _assign_whole_lots_from_origin(self):
+        """Assign lots to moves based on their origin moves (multi-step propagation).
+
+        Called AFTER the origin picking has been fully validated and quants
+        have been moved to the intermediate location.
+        """
+        Quant = self.env['stock.quant']
+
+        for move in self:
+            if move.state not in ('confirmed', 'partially_available', 'waiting'):
+                continue
+
+            product = move.product_id
+            rounding = product.uom_id.rounding
+
+            total_demand_move_uom = move.product_uom_qty
+            total_demand = move.product_uom._compute_quantity(
+                total_demand_move_uom, product.uom_id, rounding_method='HALF-UP'
+            )
+
+            already_reserved = self._get_reserved_qty(move)
+            need = total_demand - already_reserved
+
+            if float_is_zero(need, precision_rounding=rounding) or \
+                    float_compare(need, 0, precision_rounding=rounding) <= 0:
+                continue
+
+            # Get lots from origin moves
+            lot_assignments = []
+            for orig_move in move.move_orig_ids:
+                if orig_move.state != 'done':
+                    continue
+                for ml in orig_move.move_line_ids:
+                    if ml.lot_id and float_compare(
+                        ml.quantity, 0, precision_rounding=rounding
+                    ) > 0:
+                        lot_assignments.append({
+                            'lot_id': ml.lot_id,
+                            'qty': ml.quantity,
+                        })
+
+            if not lot_assignments:
+                # No origin lots found, fall back to standard whole-lot selection
+                _logger.info(
+                    "WholeLot: No origin lots for %s, falling back to standard selection",
+                    product.display_name
+                )
+                move._assign_whole_lots()
+                continue
+
+            _logger.info(
+                "WholeLot: Propagating %d lot(s) from origin to %s (picking %s): %s",
+                len(lot_assignments),
+                product.display_name,
+                move.picking_id.name if move.picking_id else 'N/A',
+                [(la['lot_id'].name, la['qty']) for la in lot_assignments]
+            )
+
+            total_reserved = 0.0
+            for lot_data in lot_assignments:
+                lot = lot_data['lot_id']
+                qty = lot_data['qty']
+
+                if float_compare(qty, 0, precision_rounding=rounding) <= 0:
+                    continue
+
+                # Verify availability at the source location
+                quants = Quant._gather(
+                    product, move.location_id, lot_id=lot, strict=False
+                )
+                available = sum(q.quantity - q.reserved_quantity for q in quants)
+
+                if float_compare(available, 0, precision_rounding=rounding) <= 0:
+                    _logger.warning(
+                        "WholeLot: Lot %s not available at %s (available=%.2f)",
+                        lot.name, move.location_id.complete_name, available
+                    )
+                    continue
+
+                reserve_qty = min(qty, available)
+
+                try:
+                    reserved = Quant._update_reserved_quantity(
+                        product, move.location_id, reserve_qty,
+                        lot_id=lot, strict=False
+                    )
+
+                    if isinstance(reserved, (int, float)):
+                        actual_reserved = reserved
+                    else:
+                        actual_reserved = sum(r[1] for r in reserved) if reserved else 0
+
+                    if float_compare(actual_reserved, 0, precision_rounding=rounding) > 0:
+                        self._create_whole_lot_move_line(
+                            move, lot, actual_reserved, product
+                        )
+                        total_reserved += actual_reserved
+                        _logger.info(
+                            "WholeLot: ✓ Propagated lot '%s' (%.2f %s) to picking %s",
+                            lot.name, actual_reserved, product.uom_id.name,
+                            move.picking_id.name if move.picking_id else 'N/A'
+                        )
+                except Exception as e:
+                    _logger.warning(
+                        "WholeLot: Failed to propagate lot '%s': %s",
+                        lot.name, str(e)
+                    )
+                    continue
+
+            # Update move state
+            if float_compare(total_reserved, 0, precision_rounding=rounding) > 0:
+                new_reserved = self._get_reserved_qty(move)
+                if float_compare(new_reserved, total_demand, precision_rounding=rounding) >= 0:
+                    move.write({'state': 'assigned'})
+                elif move.state != 'partially_available':
+                    move.write({'state': 'partially_available'})
 
     def _create_whole_lot_move_line(self, move, lot, quantity, product):
         """Create a stock.move.line for a whole-lot reservation."""
