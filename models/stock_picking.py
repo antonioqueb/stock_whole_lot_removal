@@ -142,6 +142,26 @@ class StockPicking(models.Model):
                 if not all_so_lot_ids:
                     continue
 
+                # ─── FIX: Filtrar lotes que ya no existen en la BD ───
+                # Los campos JSON y x_selected_lots pueden retener IDs de lotes
+                # eliminados. lot_ids (Many2many) se auto-limpia, pero los otros no.
+                if all_so_lot_ids:
+                    existing_so_lots = self.env['stock.lot'].browse(list(all_so_lot_ids)).exists()
+                    removed_ids = all_so_lot_ids - set(existing_so_lots.ids)
+                    if removed_ids:
+                        _logger.warning(
+                            "WholeLot: Filtered out %d non-existent lot IDs from SO sources: %s",
+                            len(removed_ids), list(removed_ids)
+                        )
+                        all_so_lot_ids = set(existing_so_lots.ids)
+
+                if not all_so_lot_ids:
+                    _logger.info(
+                        "WholeLot: No valid SO lots remain after filtering, skipping move %d",
+                        move.id
+                    )
+                    continue
+
                 # ─── Collect ALL delivered lots across all done moves ───
                 all_delivered_ids = set()
                 done_moves = sol.move_ids.filtered(lambda m: m.state == 'done')
@@ -197,7 +217,16 @@ class StockPicking(models.Model):
                     move.move_line_ids.unlink()
 
                 # ─── Force-assign pending lots ───
-                pending_lots = self.env['stock.lot'].browse(list(pending_lot_ids))
+                # FIX: Usar .exists() para asegurar que todos los lotes pendientes
+                # realmente existen en la BD antes de iterar
+                pending_lots = self.env['stock.lot'].browse(list(pending_lot_ids)).exists()
+                if len(pending_lots) < len(pending_lot_ids):
+                    missing = pending_lot_ids - set(pending_lots.ids)
+                    _logger.warning(
+                        "WholeLot: %d pending lot(s) no longer exist in DB: %s",
+                        len(missing), list(missing)
+                    )
+
                 total_reserved = 0.0
 
                 for lot in pending_lots:
@@ -328,5 +357,3 @@ class StockPicking(models.Model):
                     [(ml.lot_id.name, ml.quantity)
                      for ml in move.move_line_ids if ml.lot_id]
                 )
-
-    
