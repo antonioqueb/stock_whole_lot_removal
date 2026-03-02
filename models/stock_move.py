@@ -43,8 +43,21 @@ class StockMove(models.Model):
                 regular_moves |= move
                 continue
 
+            # ══════════════════════════════════════════════════════════════
+            # FIX: Si el move viene de una línea de venta SIN lotes 
+            # seleccionados manualmente, NO reservar automáticamente.
+            # El picking se queda sin reservas, esperando selección manual.
+            # ══════════════════════════════════════════════════════════════
+            sol = move.sale_line_id
+            if sol and not self._sol_has_manual_lot_selection(sol):
+                _logger.info(
+                    "WholeLot: SKIP - Move %d (SO Line %d) has no manual lot selection. "
+                    "Leaving unreserved for manual picking.",
+                    move.id, sol.id
+                )
+                continue
+
             # Si tiene origen (es el paso 2+ de una cadena), diferir
-            # Se manejan después en _propagate_whole_lots_to_next_step
             if move.move_orig_ids and not self.env.context.get('force_whole_lot_assign'):
                 _logger.info(
                     "WholeLot: Deferring reservation for %s (picking %s) - "
@@ -68,6 +81,33 @@ class StockMove(models.Model):
             whole_lot_moves._assign_whole_lots()
 
         return True
+
+    def _sol_has_manual_lot_selection(self, sol):
+        """
+        Verifica si una línea de venta tiene lotes seleccionados manualmente
+        en CUALQUIERA de las fuentes posibles (lot_ids, x_selected_lots, x_lot_breakdown_json).
+        Retorna True si hay selección manual, False si no.
+        """
+        # Fuente 1: lot_ids (sale_stone_selection)
+        if hasattr(sol, 'lot_ids') and sol.lot_ids:
+            return True
+
+        # Fuente 2: x_selected_lots (inventory_shopping_cart)
+        if hasattr(sol, 'x_selected_lots') and sol.x_selected_lots:
+            return True
+
+        # Fuente 3: x_lot_breakdown_json
+        if hasattr(sol, 'x_lot_breakdown_json') and sol.x_lot_breakdown_json:
+            try:
+                json_data = sol.x_lot_breakdown_json
+                if isinstance(json_data, str):
+                    json_data = json.loads(json_data)
+                if isinstance(json_data, dict) and json_data:
+                    return True
+            except Exception:
+                pass
+
+        return False
 
     def _get_reserved_qty(self, move):
         """Get the currently reserved quantity for a move in its product UoM."""
@@ -287,7 +327,20 @@ class StockMove(models.Model):
                     )
                     continue
             else:
-                _logger.info("WholeLot: No SO restrictions detected (Open selection).")
+                # ══════════════════════════════════════════════════════════
+                # CAMBIO: Si no hay restricción Y viene de una SO, 
+                # NO asignar automáticamente. Esto ya se maneja arriba en
+                # _action_assign, pero este es un safety net adicional.
+                # ══════════════════════════════════════════════════════════
+                if move.sale_line_id:
+                    _logger.info(
+                        "WholeLot: No SO restrictions detected for SO Line %s. "
+                        "SKIPPING auto-assignment (waiting for manual selection).",
+                        move.sale_line_id.id
+                    )
+                    continue
+                else:
+                    _logger.info("WholeLot: No SO restrictions detected (non-sale move). Open selection.")
             # ==============================================================================
 
             # 2. Selección Matemática
