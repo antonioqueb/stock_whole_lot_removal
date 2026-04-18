@@ -10,27 +10,41 @@ _logger = logging.getLogger(__name__)
 class StockMove(models.Model):
     _inherit = 'stock.move'
 
-    def _should_use_whole_lot_strategy(self):
-        """Determine if this move should use the whole_lot removal strategy."""
+    # ═══════════════════════════════════════════════════════════════════════════
+    # DETECCIÓN DE ESTRATEGIA
+    # ═══════════════════════════════════════════════════════════════════════════
+
+    def _get_whole_lot_strategy_type(self):
+        """Returns: False, 'whole_lot', or 'whole_lot_partial'."""
         self.ensure_one()
         product = self.product_id
         if product.tracking not in ('lot', 'serial'):
             return False
 
-        if product.categ_id.removal_strategy_id and \
-                product.categ_id.removal_strategy_id.method == 'whole_lot':
-            return True
+        if product.categ_id.removal_strategy_id:
+            method = product.categ_id.removal_strategy_id.method
+            if method in ('whole_lot', 'whole_lot_partial'):
+                return method
 
         location = self.location_id
         while location:
-            if location.removal_strategy_id and \
-                    location.removal_strategy_id.method == 'whole_lot':
-                return True
+            if location.removal_strategy_id:
+                method = location.removal_strategy_id.method
+                if method in ('whole_lot', 'whole_lot_partial'):
+                    return method
             location = location.location_id
         return False
 
+    def _should_use_whole_lot_strategy(self):
+        """Returns True if ANY of the whole_lot strategies applies."""
+        return bool(self._get_whole_lot_strategy_type())
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # HOOK _action_assign
+    # ═══════════════════════════════════════════════════════════════════════════
+
     def _action_assign(self, force_qty=False):
-        """Override to intercept moves that use whole_lot removal strategy."""
+        """Override to intercept moves that use whole_lot* removal strategies."""
         if self.env.context.get('skip_whole_lot_strategy'):
             return super()._action_assign(force_qty=force_qty)
 
@@ -43,11 +57,6 @@ class StockMove(models.Model):
                 regular_moves |= move
                 continue
 
-            # ══════════════════════════════════════════════════════════════
-            # FIX: Si el move viene de una línea de venta SIN lotes 
-            # seleccionados manualmente, NO reservar automáticamente.
-            # El picking se queda sin reservas, esperando selección manual.
-            # ══════════════════════════════════════════════════════════════
             sol = move.sale_line_id
             if sol and not self._sol_has_manual_lot_selection(sol):
                 _logger.info(
@@ -57,7 +66,6 @@ class StockMove(models.Model):
                 )
                 continue
 
-            # Si tiene origen (es el paso 2+ de una cadena), diferir
             if move.move_orig_ids and not self.env.context.get('force_whole_lot_assign'):
                 _logger.info(
                     "WholeLot: Deferring reservation for %s (picking %s) - "
@@ -71,32 +79,25 @@ class StockMove(models.Model):
 
             whole_lot_moves |= move
 
-        # Process regular moves with standard Odoo logic
         if regular_moves:
             super(StockMove, regular_moves)._action_assign(force_qty=force_qty)
 
-        # Process whole-lot moves
         if whole_lot_moves:
-            _logger.info(f"WholeLot: Processing {len(whole_lot_moves)} moves with Whole Lot Strategy...")
+            _logger.info(f"WholeLot: Processing {len(whole_lot_moves)} moves with WholeLot strategy...")
             whole_lot_moves._assign_whole_lots()
 
         return True
 
+    # ═══════════════════════════════════════════════════════════════════════════
+    # HELPERS COMPARTIDOS
+    # ═══════════════════════════════════════════════════════════════════════════
+
     def _sol_has_manual_lot_selection(self, sol):
-        """
-        Verifica si una línea de venta tiene lotes seleccionados manualmente
-        en CUALQUIERA de las fuentes posibles (lot_ids, x_selected_lots, x_lot_breakdown_json).
-        Retorna True si hay selección manual, False si no.
-        """
-        # Fuente 1: lot_ids (sale_stone_selection)
+        """Verifica si una línea de venta tiene lotes seleccionados manualmente."""
         if hasattr(sol, 'lot_ids') and sol.lot_ids:
             return True
-
-        # Fuente 2: x_selected_lots (inventory_shopping_cart)
         if hasattr(sol, 'x_selected_lots') and sol.x_selected_lots:
             return True
-
-        # Fuente 3: x_lot_breakdown_json
         if hasattr(sol, 'x_lot_breakdown_json') and sol.x_lot_breakdown_json:
             try:
                 json_data = sol.x_lot_breakdown_json
@@ -106,7 +107,6 @@ class StockMove(models.Model):
                     return True
             except Exception:
                 pass
-
         return False
 
     def _get_reserved_qty(self, move):
@@ -121,65 +121,100 @@ class StockMove(models.Model):
         return reserved
 
     def _get_already_delivered_lot_ids(self, sale_line):
-        """
-        Obtiene los IDs de lotes que ya fueron entregados (en moves done)
-        para una línea de venta específica.
-        """
+        """Obtiene IDs de lotes ya entregados (moves done) para una SO line."""
         delivered_lot_ids = set()
-
         if not sale_line:
             return delivered_lot_ids
-
         done_moves = sale_line.move_ids.filtered(lambda m: m.state == 'done')
-
         for move in done_moves:
             for ml in move.move_line_ids:
                 if ml.lot_id:
                     delivered_lot_ids.add(ml.lot_id.id)
-
         if delivered_lot_ids:
             _logger.info(
                 "WholeLot: Found %d already-delivered lots for SO Line %s: %s",
                 len(delivered_lot_ids), sale_line.id, list(delivered_lot_ids)
             )
-
         return delivered_lot_ids
 
     def _get_currently_reserved_lot_ids(self, sale_line, exclude_move=None):
-        """
-        Obtiene los IDs de lotes actualmente reservados en moves activos
-        (assigned/partially_available) de la misma SO line.
-        Excluye el move actual para no contarlo dos veces.
-        """
+        """Obtiene IDs de lotes reservados en moves activos de la misma SO line."""
         reserved_lot_ids = set()
-
         if not sale_line:
             return reserved_lot_ids
-
         active_moves = sale_line.move_ids.filtered(
-            lambda m: m.state in ('assigned', 'partially_available')
-            and m != exclude_move
+            lambda m: m.state in ('assigned', 'partially_available') and m != exclude_move
         )
-
         for move in active_moves:
             for ml in move.move_line_ids:
                 if ml.lot_id:
                     reserved_lot_ids.add(ml.lot_id.id)
-
         if reserved_lot_ids:
             _logger.info(
                 "WholeLot: Found %d lots reserved in sibling moves for SO Line %s: %s",
                 len(reserved_lot_ids), sale_line.id, list(reserved_lot_ids)
             )
-
         return reserved_lot_ids
 
+    def _get_sol_lot_selection(self, sol):
+        """Extrae la selección de lotes desde TODAS las fuentes posibles.
+
+        Returns:
+            dict {
+                'lot_ids': set(ids),
+                'breakdown': dict {lot_id: qty} — solo lotes con cantidad explícita
+            }
+        """
+        result = {'lot_ids': set(), 'breakdown': {}}
+        if not sol:
+            return result
+
+        # FUENTE 1: x_lot_breakdown_json (ÚNICA con cantidades explícitas)
+        if hasattr(sol, 'x_lot_breakdown_json') and sol.x_lot_breakdown_json:
+            try:
+                json_data = sol.x_lot_breakdown_json
+                if isinstance(json_data, str):
+                    json_data = json.loads(json_data)
+                if isinstance(json_data, dict):
+                    for k, v in json_data.items():
+                        if str(k).isdigit():
+                            lot_id = int(k)
+                            result['lot_ids'].add(lot_id)
+                            try:
+                                result['breakdown'][lot_id] = float(v)
+                            except (ValueError, TypeError):
+                                pass
+            except Exception as e:
+                _logger.warning(f"WholeLot: Failed to parse x_lot_breakdown_json: {e}")
+
+        # FUENTE 2: x_selected_lots
+        if hasattr(sol, 'x_selected_lots') and sol.x_selected_lots:
+            try:
+                cart_lot_ids = sol.x_selected_lots.mapped('lot_id').ids
+                result['lot_ids'].update(cart_lot_ids)
+            except Exception:
+                pass
+
+        # FUENTE 3: lot_ids
+        if hasattr(sol, 'lot_ids') and sol.lot_ids:
+            result['lot_ids'].update(sol.lot_ids.ids)
+
+        return result
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # DISPATCHER PRINCIPAL
+    # ═══════════════════════════════════════════════════════════════════════════
+
     def _assign_whole_lots(self):
-        """Reserve stock using whole-lot strategy with Dynamic Module Linking and Recovery."""
+        """Dispatch: bifurca entre whole_lot (lotes completos) y whole_lot_partial."""
         Quant = self.env['stock.quant']
 
         for move in self:
             if move.state not in ('confirmed', 'partially_available', 'waiting'):
+                continue
+
+            strategy = move._get_whole_lot_strategy_type()
+            if not strategy:
                 continue
 
             product = move.product_id
@@ -197,8 +232,8 @@ class StockMove(models.Model):
 
             _logger.info("=" * 80)
             _logger.info(
-                "WholeLot: Move %d [%s] @ %s%s",
-                move.id, product.default_code, move.location_id.display_name,
+                "WholeLot[%s]: Move %d [%s] @ %s%s",
+                strategy, move.id, product.default_code, move.location_id.display_name,
                 ' [BACKORDER of %s]' % move.picking_id.backorder_id.name if is_backorder else ''
             )
             _logger.info(f"WholeLot: Demand: {total_demand:.2f}, Reserved: {already_reserved:.2f}, Need: {need:.2f}")
@@ -208,13 +243,12 @@ class StockMove(models.Model):
                 _logger.info("WholeLot: Need is zero, skipping.")
                 continue
 
-            # 1. Obtener lotes físicamente disponibles
             available_lots = Quant._get_whole_lot_available_quants(
                 product, move.location_id
             )
 
             avail_debug = [f"{d['lot_id'].name} ({d['available_qty']:.2f})" for d in available_lots]
-            _logger.info(f"WholeLot: Physical Availability at {move.location_id.name} (Count: {len(available_lots)}): {avail_debug}")
+            _logger.info(f"WholeLot: Physical Availability (Count: {len(available_lots)}): {avail_debug}")
 
             if not available_lots:
                 _logger.warning(
@@ -223,195 +257,53 @@ class StockMove(models.Model):
                 )
                 continue
 
-            # ==============================================================================
-            # VINCULACIÓN DINÁMICA: RECUPERACIÓN DE LOTES
-            # ==============================================================================
-            allowed_lot_ids = set()
-            has_restriction = False
+            sol = move.sale_line_id
+            selection = self._get_sol_lot_selection(sol)
+            already_delivered_ids = self._get_already_delivered_lot_ids(sol) if sol else set()
+            currently_reserved_ids = self._get_currently_reserved_lot_ids(sol, exclude_move=move) if sol else set()
 
-            # Obtener lotes ya entregados para excluirlos
-            already_delivered_ids = set()
-            if move.sale_line_id:
-                already_delivered_ids = self._get_already_delivered_lot_ids(move.sale_line_id)
-
-            # Obtener lotes reservados en otros moves activos (para no duplicar)
-            currently_reserved_ids = set()
-            if move.sale_line_id:
-                currently_reserved_ids = self._get_currently_reserved_lot_ids(
-                    move.sale_line_id, exclude_move=move
-                )
-
-            if move.sale_line_id:
-                sol = move.sale_line_id
-
-                # FUENTE 1: JSON Breakdown
-                if hasattr(sol, 'x_lot_breakdown_json') and sol.x_lot_breakdown_json:
-                    try:
-                        json_data = sol.x_lot_breakdown_json
-                        if isinstance(json_data, str):
-                            json_data = json.loads(json_data)
-
-                        if isinstance(json_data, dict):
-                            json_ids = [int(k) for k in json_data.keys() if k.isdigit()]
-                            if json_ids:
-                                has_restriction = True
-                                allowed_lot_ids.update(json_ids)
-                                _logger.info(f"WholeLot: Recovered {len(json_ids)} lots from SO.x_lot_breakdown_json")
-                    except Exception as e:
-                        _logger.warning(f"WholeLot: Failed to parse x_lot_breakdown_json: {e}")
-
-                # FUENTE 2: x_selected_lots
-                if hasattr(sol, 'x_selected_lots') and sol.x_selected_lots:
-                    cart_lot_ids = sol.x_selected_lots.mapped('lot_id').ids
-                    if cart_lot_ids:
-                        has_restriction = True
-                        prev_len = len(allowed_lot_ids)
-                        allowed_lot_ids.update(cart_lot_ids)
-                        diff = len(allowed_lot_ids) - prev_len
-                        if diff > 0:
-                            _logger.info(f"WholeLot: Recovered {diff} additional lots from SO.x_selected_lots")
-
-                # FUENTE 3: lot_ids
-                if hasattr(sol, 'lot_ids') and sol.lot_ids:
-                    has_restriction = True
-                    stone_ids = sol.lot_ids.ids
-                    prev_len = len(allowed_lot_ids)
-                    allowed_lot_ids.update(stone_ids)
-                    diff = len(allowed_lot_ids) - prev_len
-                    if diff > 0:
-                        _logger.info(f"WholeLot: Found {diff} additional lots in SO.lot_ids")
+            allowed_lot_ids = set(selection['lot_ids'])
+            has_restriction = bool(allowed_lot_ids)
 
             if has_restriction:
-                # Excluir lotes ya entregados
                 if already_delivered_ids:
-                    before_count = len(allowed_lot_ids)
                     allowed_lot_ids -= already_delivered_ids
-                    excluded = before_count - len(allowed_lot_ids)
-                    if excluded > 0:
-                        _logger.info(
-                            "WholeLot: Excluded %d already-delivered lots. "
-                            "Remaining target: %s", excluded, list(allowed_lot_ids)
-                        )
-
-                # Excluir lotes reservados en sibling moves
                 if currently_reserved_ids:
-                    before_count = len(allowed_lot_ids)
                     allowed_lot_ids -= currently_reserved_ids
-                    excluded = before_count - len(allowed_lot_ids)
-                    if excluded > 0:
-                        _logger.info(
-                            "WholeLot: Excluded %d lots reserved in sibling moves. "
-                            "Remaining target: %s", excluded, list(allowed_lot_ids)
-                        )
 
-                _logger.info(f"WholeLot: [RESTRICTION APPLIED] Combined Target Lot IDs: {list(allowed_lot_ids)}")
+                _logger.info(f"WholeLot: [RESTRICTION] Target Lot IDs after exclusions: {list(allowed_lot_ids)}")
 
-                filtered_lots = []
-                for lot_data in available_lots:
-                    if lot_data['lot_id'].id in allowed_lot_ids:
-                        filtered_lots.append(lot_data)
-
-                original_count = len(available_lots)
-                available_lots = filtered_lots
-
-                _logger.info(
-                    f"WholeLot: Filter result: {original_count} -> {len(available_lots)} candidates. "
-                    f"Valid candidates: {[d['lot_id'].name for d in available_lots]}"
-                )
+                available_lots = [d for d in available_lots if d['lot_id'].id in allowed_lot_ids]
 
                 if not available_lots:
                     _logger.error(
-                        "WholeLot: CRITICAL - The SO requires specific lots (checked JSON/Cart/Line), "
-                        "but NONE of them are physically in the source location. "
-                        "Preventing random assignment."
+                        "WholeLot: CRITICAL - SO requires specific lots but NONE are physically "
+                        "at the source location. Preventing random assignment."
                     )
                     continue
             else:
-                # ══════════════════════════════════════════════════════════
-                # CAMBIO: Si no hay restricción Y viene de una SO, 
-                # NO asignar automáticamente. Esto ya se maneja arriba en
-                # _action_assign, pero este es un safety net adicional.
-                # ══════════════════════════════════════════════════════════
-                if move.sale_line_id:
+                if sol:
                     _logger.info(
-                        "WholeLot: No SO restrictions detected for SO Line %s. "
-                        "SKIPPING auto-assignment (waiting for manual selection).",
-                        move.sale_line_id.id
+                        "WholeLot: No SO restrictions for SO Line %s. SKIPPING auto-assignment.",
+                        sol.id
                     )
                     continue
                 else:
-                    _logger.info("WholeLot: No SO restrictions detected (non-sale move). Open selection.")
-            # ==============================================================================
+                    _logger.info("WholeLot: No SO restrictions (non-sale move). Open selection.")
 
-            # 2. Selección Matemática
-            selected = Quant._whole_lot_select_lots(available_lots, need, rounding)
-
-            if not selected:
-                _logger.info(
-                    "WholeLot: Math logic could not select complete lots for demand %.2f. Candidates: %s",
-                    need, [d['lot_id'].name for d in available_lots]
+            # BIFURCACIÓN
+            if strategy == 'whole_lot_partial':
+                total_reserved = self._reserve_whole_lot_partial(
+                    move, available_lots, selection['breakdown'], rounding
                 )
-                continue
+            else:
+                total_reserved = self._reserve_whole_lot_complete(
+                    move, available_lots, need, rounding
+                )
 
-            # 3. Ejecutar Reserva
-            total_reserved = 0.0
-            for lot_data in selected:
-                lot = lot_data['lot_id']
-                qty = lot_data['available_qty']
-
-                if float_compare(qty, 0, precision_rounding=rounding) <= 0:
-                    continue
-
-                try:
-                    reserved_before = sum(
-                        q.reserved_quantity
-                        for q in Quant._gather(
-                            product, move.location_id, lot_id=lot, strict=False
-                        )
-                    )
-
-                    Quant._update_reserved_quantity(
-                        product, move.location_id, qty,
-                        lot_id=lot, strict=False
-                    )
-
-                    reserved_after = sum(
-                        q.reserved_quantity
-                        for q in Quant._gather(
-                            product, move.location_id, lot_id=lot, strict=False
-                        )
-                    )
-
-                    actual_reserved = reserved_after - reserved_before
-
-                    if float_compare(actual_reserved, 0, precision_rounding=rounding) > 0:
-                        self._create_whole_lot_move_line(
-                            move, lot, actual_reserved, product
-                        )
-                        total_reserved += actual_reserved
-                        _logger.info(
-                            "WholeLot: SUCCESS - Reserved lot '%s' (%.2f %s)",
-                            lot.name, actual_reserved, product.uom_id.name
-                        )
-                    else:
-                        _logger.warning(
-                            "WholeLot: FAILED - Reservation had no effect for lot '%s'. "
-                            "Maybe reserved by another user?", lot.name
-                        )
-                except Exception as e:
-                    _logger.error(
-                        "WholeLot: EXCEPTION reserving lot '%s': %s",
-                        lot.name if lot else 'N/A', str(e)
-                    )
-                    continue
-
-            # 4. Actualizar Estado del Movimiento
             if float_compare(total_reserved, 0, precision_rounding=rounding) > 0:
                 new_reserved = self._get_reserved_qty(move)
-                cmp = float_compare(
-                    new_reserved, total_demand,
-                    precision_rounding=rounding
-                )
+                cmp = float_compare(new_reserved, total_demand, precision_rounding=rounding)
                 if cmp >= 0:
                     move.write({'state': 'assigned'})
                     _logger.info("WholeLot: Move state updated to ASSIGNED")
@@ -421,10 +313,119 @@ class StockMove(models.Model):
 
             _logger.info("=" * 80)
 
+    # ═══════════════════════════════════════════════════════════════════════════
+    # ESTRATEGIA 1: whole_lot (PLACAS)
+    # ═══════════════════════════════════════════════════════════════════════════
+
+    def _reserve_whole_lot_complete(self, move, available_lots, need, rounding):
+        """Reserva lotes COMPLETOS (sin dividir). Usado por placas."""
+        Quant = self.env['stock.quant']
+        product = move.product_id
+
+        selected = Quant._whole_lot_select_lots(available_lots, need, rounding)
+        if not selected:
+            _logger.info(
+                "WholeLot[complete]: Could not select complete lots for demand %.2f. Candidates: %s",
+                need, [d['lot_id'].name for d in available_lots]
+            )
+            return 0.0
+
+        total_reserved = 0.0
+        for lot_data in selected:
+            lot = lot_data['lot_id']
+            qty = lot_data['available_qty']
+            if float_compare(qty, 0, precision_rounding=rounding) <= 0:
+                continue
+            reserved = self._do_reserve_lot(move, lot, qty, product, rounding)
+            total_reserved += reserved
+        return total_reserved
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # ESTRATEGIA 2: whole_lot_partial (FORMATOS/PIEZAS)
+    # ═══════════════════════════════════════════════════════════════════════════
+
+    def _reserve_whole_lot_partial(self, move, available_lots, breakdown, rounding):
+        """Reserva cantidades PARCIALES según breakdown."""
+        product = move.product_id
+        total_reserved = 0.0
+
+        for lot_data in available_lots:
+            lot = lot_data['lot_id']
+            available_qty = lot_data['available_qty']
+
+            desired_qty = breakdown.get(lot.id)
+
+            if desired_qty is None:
+                qty_to_reserve = available_qty
+                _logger.info(
+                    "WholeLot[partial]: Lot %s - no breakdown, using full available %.2f",
+                    lot.name, available_qty
+                )
+            else:
+                qty_to_reserve = min(desired_qty, available_qty)
+                if float_compare(qty_to_reserve, desired_qty, precision_rounding=rounding) < 0:
+                    _logger.warning(
+                        "WholeLot[partial]: Lot %s - desired %.2f but only %.2f available",
+                        lot.name, desired_qty, available_qty
+                    )
+                else:
+                    _logger.info(
+                        "WholeLot[partial]: Lot %s - reserving %.2f (breakdown)",
+                        lot.name, qty_to_reserve
+                    )
+
+            if float_compare(qty_to_reserve, 0, precision_rounding=rounding) <= 0:
+                continue
+
+            reserved = self._do_reserve_lot(move, lot, qty_to_reserve, product, rounding)
+            total_reserved += reserved
+
+        return total_reserved
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # RESERVA ATÓMICA (COMPARTIDA)
+    # ═══════════════════════════════════════════════════════════════════════════
+
+    def _do_reserve_lot(self, move, lot, qty, product, rounding):
+        """Reserva `qty` del `lot` y crea el move_line. Returns: cantidad reservada."""
+        Quant = self.env['stock.quant']
+
+        try:
+            reserved_before = sum(
+                q.reserved_quantity
+                for q in Quant._gather(product, move.location_id, lot_id=lot, strict=False)
+            )
+
+            Quant._update_reserved_quantity(
+                product, move.location_id, qty, lot_id=lot, strict=False
+            )
+
+            reserved_after = sum(
+                q.reserved_quantity
+                for q in Quant._gather(product, move.location_id, lot_id=lot, strict=False)
+            )
+
+            actual_reserved = reserved_after - reserved_before
+
+            if float_compare(actual_reserved, 0, precision_rounding=rounding) > 0:
+                self._create_whole_lot_move_line(move, lot, actual_reserved, product)
+                _logger.info(
+                    "WholeLot: SUCCESS - Reserved lot '%s' (%.2f %s)",
+                    lot.name, actual_reserved, product.uom_id.name
+                )
+                return actual_reserved
+            else:
+                _logger.warning(
+                    "WholeLot: FAILED - Reservation had no effect for lot '%s'.", lot.name
+                )
+                return 0.0
+        except Exception as e:
+            _logger.error("WholeLot: EXCEPTION reserving lot '%s': %s",
+                          lot.name if lot else 'N/A', str(e))
+            return 0.0
+
     def _create_whole_lot_move_line(self, move, lot, quantity, product):
         """Create a stock.move.line for a whole-lot reservation."""
-        rounding = product.uom_id.rounding
-
         uom_qty = product.uom_id._compute_quantity(
             quantity, move.product_uom, rounding_method='HALF-UP'
         )

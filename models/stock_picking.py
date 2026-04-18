@@ -11,10 +11,7 @@ class StockPicking(models.Model):
     _inherit = 'stock.picking'
 
     def button_validate(self):
-        """After validating a picking, propagate lots to:
-        1. Downstream moves (OUT step) that were deferred
-        2. Backorder PICK moves - force correct lot assignment
-        """
+        """After validating: propagate lots to downstream moves and backorders."""
         validating_ids = self.ids
         res = super().button_validate()
 
@@ -25,6 +22,10 @@ class StockPicking(models.Model):
             picking._assign_whole_lots_to_backorder()
 
         return res
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # PROPAGACIÓN A SIGUIENTE PASO
+    # ═══════════════════════════════════════════════════════════════════════════
 
     def _propagate_whole_lots_to_next_step(self):
         """Find downstream moves that were deferred and assign them."""
@@ -52,41 +53,18 @@ class StockPicking(models.Model):
             return
 
         _logger.info(
-            "WholeLot: Post-validation propagation from %s -> %d deferred move(s): %s",
-            self.name, len(deferred_moves),
-            [(m.id, m.product_id.display_name, m.picking_id.name if m.picking_id else 'N/A')
-             for m in deferred_moves]
+            "WholeLot: Post-validation propagation from %s -> %d deferred move(s)",
+            self.name, len(deferred_moves)
         )
 
         deferred_moves.with_context(skip_whole_lot_strategy=True)._action_assign()
 
-        for move in deferred_moves:
-            _logger.info(
-                "WholeLot: Post-propagation result: move %d state=%s, "
-                "move_lines=%d, lots=%s (picking %s)",
-                move.id, move.state,
-                len(move.move_line_ids),
-                [(ml.lot_id.name, ml.quantity)
-                 for ml in move.move_line_ids if ml.lot_id],
-                move.picking_id.name if move.picking_id else 'N/A'
-            )
+    # ═══════════════════════════════════════════════════════════════════════════
+    # ASIGNACIÓN AL BACKORDER
+    # ═══════════════════════════════════════════════════════════════════════════
 
     def _assign_whole_lots_to_backorder(self):
-        """Force-assign correct pending lots to backorder PICK.
-
-        WHY THIS IS NEEDED:
-        When button_validate creates a backorder, Odoo transfers reservations
-        from the original PICK to the backorder. But within the same transaction,
-        _get_whole_lot_available_quants can't see the pending lots as "available"
-        because their reserved_quantity is still > 0.
-
-        APPROACH:
-        Don't search for "available" quants. Instead:
-        1. Calculate which lots were delivered vs which the SO needs
-        2. Pending = SO lots - delivered lots
-        3. Read the quant quantities directly (ignoring reserved_quantity)
-        4. Create move_lines that claim the already-transferred reservations
-        """
+        """Force-assign pending lots to backorder. Respeta whole_lot y whole_lot_partial."""
         self.ensure_one()
 
         backorder_pickings = self.env['stock.picking'].search([
@@ -104,7 +82,8 @@ class StockPicking(models.Model):
                 if move.state not in ('confirmed', 'partially_available', 'waiting', 'assigned'):
                     continue
                 try:
-                    if not move._should_use_whole_lot_strategy():
+                    strategy = move._get_whole_lot_strategy_type()
+                    if not strategy:
                         continue
                 except Exception:
                     continue
@@ -112,57 +91,28 @@ class StockPicking(models.Model):
                 product = move.product_id
                 rounding = product.uom_id.rounding
                 sol = move.sale_line_id
-
                 if not sol:
                     continue
 
-                # ─── Collect ALL lots the SO requires ───
-                all_so_lot_ids = set()
-
-                if hasattr(sol, 'x_lot_breakdown_json') and sol.x_lot_breakdown_json:
-                    try:
-                        json_data = sol.x_lot_breakdown_json
-                        if isinstance(json_data, str):
-                            json_data = json.loads(json_data)
-                        if isinstance(json_data, dict):
-                            all_so_lot_ids.update(
-                                int(k) for k in json_data.keys() if k.isdigit()
-                            )
-                    except Exception:
-                        pass
-
-                if hasattr(sol, 'x_selected_lots') and sol.x_selected_lots:
-                    all_so_lot_ids.update(
-                        sol.x_selected_lots.mapped('lot_id').ids
-                    )
-
-                if hasattr(sol, 'lot_ids') and sol.lot_ids:
-                    all_so_lot_ids.update(sol.lot_ids.ids)
+                selection = move._get_sol_lot_selection(sol)
+                all_so_lot_ids = selection['lot_ids']
+                breakdown = selection['breakdown']
 
                 if not all_so_lot_ids:
                     continue
 
-                # ─── FIX: Filtrar lotes que ya no existen en la BD ───
-                # Los campos JSON y x_selected_lots pueden retener IDs de lotes
-                # eliminados. lot_ids (Many2many) se auto-limpia, pero los otros no.
-                if all_so_lot_ids:
-                    existing_so_lots = self.env['stock.lot'].browse(list(all_so_lot_ids)).exists()
-                    removed_ids = all_so_lot_ids - set(existing_so_lots.ids)
-                    if removed_ids:
-                        _logger.warning(
-                            "WholeLot: Filtered out %d non-existent lot IDs from SO sources: %s",
-                            len(removed_ids), list(removed_ids)
-                        )
-                        all_so_lot_ids = set(existing_so_lots.ids)
+                existing_so_lots = self.env['stock.lot'].browse(list(all_so_lot_ids)).exists()
+                removed_ids = all_so_lot_ids - set(existing_so_lots.ids)
+                if removed_ids:
+                    _logger.warning(
+                        "WholeLot: Filtered out %d non-existent lot IDs: %s",
+                        len(removed_ids), list(removed_ids)
+                    )
+                    all_so_lot_ids = set(existing_so_lots.ids)
 
                 if not all_so_lot_ids:
-                    _logger.info(
-                        "WholeLot: No valid SO lots remain after filtering, skipping move %d",
-                        move.id
-                    )
                     continue
 
-                # ─── Collect ALL delivered lots across all done moves ───
                 all_delivered_ids = set()
                 done_moves = sol.move_ids.filtered(lambda m: m.state == 'done')
                 for dm in done_moves:
@@ -170,39 +120,40 @@ class StockPicking(models.Model):
                         if ml.lot_id:
                             all_delivered_ids.add(ml.lot_id.id)
 
-                # Pending = what SO needs minus what's delivered
                 pending_lot_ids = all_so_lot_ids - all_delivered_ids
 
                 _logger.info(
-                    "WholeLot: Backorder %s move %d - SO lots: %s, "
-                    "Delivered: %s, Pending: %s",
-                    bo_picking.name, move.id,
-                    list(all_so_lot_ids), list(all_delivered_ids),
-                    list(pending_lot_ids)
+                    "WholeLot[%s]: Backorder %s move %d - SO: %s, Delivered: %s, Pending: %s",
+                    strategy, bo_picking.name, move.id,
+                    list(all_so_lot_ids), list(all_delivered_ids), list(pending_lot_ids)
                 )
 
                 if not pending_lot_ids:
-                    _logger.info(
-                        "WholeLot: All SO lots already delivered, nothing for backorder"
-                    )
                     continue
 
-                # ─── Check if backorder already has correct lots ───
                 existing_lot_ids = set(
                     ml.lot_id.id for ml in move.move_line_ids if ml.lot_id
                 )
                 if existing_lot_ids == pending_lot_ids:
-                    _logger.info(
-                        "WholeLot: Backorder already has correct lots, skipping"
-                    )
-                    continue
+                    if strategy == 'whole_lot_partial' and breakdown:
+                        qtys_match = all(
+                            float_compare(
+                                ml.quantity if 'quantity' in ml._fields else 0.0,
+                                breakdown.get(ml.lot_id.id, 0.0),
+                                precision_rounding=rounding
+                            ) == 0
+                            for ml in move.move_line_ids if ml.lot_id
+                        )
+                        if qtys_match:
+                            _logger.info("WholeLot: Backorder already has correct lots+qtys, skipping")
+                            continue
+                    else:
+                        _logger.info("WholeLot: Backorder already has correct lots, skipping")
+                        continue
 
-                # ─── Clear incorrect move_lines ───
                 if move.move_line_ids:
                     _logger.info(
-                        "WholeLot: Clearing %d incorrect move_lines (lots: %s)",
-                        len(move.move_line_ids),
-                        [ml.lot_id.name for ml in move.move_line_ids if ml.lot_id]
+                        "WholeLot: Clearing %d incorrect move_lines", len(move.move_line_ids)
                     )
                     for ml in move.move_line_ids:
                         ml_qty = ml.quantity if 'quantity' in ml._fields else 0.0
@@ -216,17 +167,7 @@ class StockPicking(models.Model):
                                 pass
                     move.move_line_ids.unlink()
 
-                # ─── Force-assign pending lots ───
-                # FIX: Usar .exists() para asegurar que todos los lotes pendientes
-                # realmente existen en la BD antes de iterar
                 pending_lots = self.env['stock.lot'].browse(list(pending_lot_ids)).exists()
-                if len(pending_lots) < len(pending_lot_ids):
-                    missing = pending_lot_ids - set(pending_lots.ids)
-                    _logger.warning(
-                        "WholeLot: %d pending lot(s) no longer exist in DB: %s",
-                        len(missing), list(missing)
-                    )
-
                 total_reserved = 0.0
 
                 for lot in pending_lots:
@@ -244,61 +185,54 @@ class StockPicking(models.Model):
                     lot_total_qty = sum(q.quantity for q in quants)
                     lot_reserved_qty = sum(q.reserved_quantity for q in quants)
                     lot_available_qty = lot_total_qty - lot_reserved_qty
-
-                    # For quants with quantity > 0 specifically (ignore residual quants)
                     positive_quants = quants.filtered(lambda q: q.quantity > 0)
                     lot_real_qty = sum(q.quantity for q in positive_quants) if positive_quants else 0.0
 
                     _logger.info(
-                        "WholeLot: Lot %s quant info - total: %.2f, "
-                        "reserved: %.2f, available: %.2f, real_qty: %.2f, "
-                        "quant_count: %d",
+                        "WholeLot: Lot %s - total: %.2f, reserved: %.2f, available: %.2f, real_qty: %.2f",
                         lot.name, lot_total_qty, lot_reserved_qty,
-                        lot_available_qty, lot_real_qty, len(quants)
+                        lot_available_qty, lot_real_qty
                     )
 
-                    # Determine the actual quantity of this lot
-                    # Priority: real_qty (from positive quants) > lot_total_qty > lot_reserved_qty
-                    if float_compare(lot_real_qty, 0, precision_rounding=rounding) > 0:
-                        reserve_qty = lot_real_qty
-                    elif float_compare(lot_total_qty, 0, precision_rounding=rounding) > 0:
-                        reserve_qty = lot_total_qty
-                    elif float_compare(lot_reserved_qty, 0, precision_rounding=rounding) > 0:
-                        # Quant has quantity=0 but reserved>0 — this is a residual
-                        # quant from Odoo's backorder transfer. The reservation IS
-                        # ours. Use reserved_qty as the lot quantity.
-                        reserve_qty = lot_reserved_qty
-                    else:
-                        _logger.warning(
-                            "WholeLot: Lot %s has zero quantity everywhere, skipping",
-                            lot.name
+                    if strategy == 'whole_lot_partial' and lot.id in breakdown:
+                        desired_qty = breakdown[lot.id]
+                        max_available = max(lot_real_qty, lot_total_qty, lot_reserved_qty)
+                        reserve_qty = min(desired_qty, max_available)
+                        _logger.info(
+                            "WholeLot[partial]: Lot %s - breakdown says %.2f, reserving %.2f",
+                            lot.name, desired_qty, reserve_qty
                         )
+                    else:
+                        if float_compare(lot_real_qty, 0, precision_rounding=rounding) > 0:
+                            reserve_qty = lot_real_qty
+                        elif float_compare(lot_total_qty, 0, precision_rounding=rounding) > 0:
+                            reserve_qty = lot_total_qty
+                        elif float_compare(lot_reserved_qty, 0, precision_rounding=rounding) > 0:
+                            reserve_qty = lot_reserved_qty
+                        else:
+                            _logger.warning(
+                                "WholeLot: Lot %s has zero quantity, skipping", lot.name
+                            )
+                            continue
+
+                    if float_compare(reserve_qty, 0, precision_rounding=rounding) <= 0:
                         continue
 
                     if float_compare(lot_available_qty, 0, precision_rounding=rounding) > 0:
-                        # Available: reserve it normally
                         try:
+                            qty_to_reserve = min(reserve_qty, lot_available_qty)
                             Quant._update_reserved_quantity(
-                                product, move.location_id, lot_available_qty,
+                                product, move.location_id, qty_to_reserve,
                                 lot_id=lot, strict=False
                             )
                         except Exception as e:
-                            _logger.error(
-                                "WholeLot: Failed to reserve lot %s: %s",
-                                lot.name, e
-                            )
+                            _logger.error("WholeLot: Failed to reserve lot %s: %s", lot.name, e)
                             continue
                     else:
-                        # Already reserved (by Odoo's backorder transfer) or
-                        # residual quant — just create the move_line
                         _logger.info(
-                            "WholeLot: Lot %s already reserved (backorder transfer), "
-                            "creating move_line with qty %.2f",
-                            lot.name, reserve_qty
+                            "WholeLot: Lot %s already reserved (backorder transfer)", lot.name
                         )
-                        pass
 
-                    # Create move line
                     uom_qty = product.uom_id._compute_quantity(
                         reserve_qty, move.product_uom, rounding_method='HALF-UP'
                     )
@@ -320,7 +254,6 @@ class StockPicking(models.Model):
                     else:
                         ml_vals['quantity'] = uom_qty
 
-                    # Copy package/owner from quant if present
                     first_quant = quants[0]
                     if first_quant.package_id:
                         ml_vals['package_id'] = first_quant.package_id.id
@@ -331,22 +264,16 @@ class StockPicking(models.Model):
                     total_reserved += reserve_qty
 
                     _logger.info(
-                        "WholeLot: SUCCESS - Assigned lot '%s' (%.2f %s) "
-                        "to backorder %s",
-                        lot.name, reserve_qty, product.uom_id.name,
-                        bo_picking.name
+                        "WholeLot[%s]: SUCCESS - Assigned lot '%s' (%.2f %s) to backorder %s",
+                        strategy, lot.name, reserve_qty, product.uom_id.name, bo_picking.name
                     )
 
-                # Update move state
                 if float_compare(total_reserved, 0, precision_rounding=rounding) > 0:
                     total_demand = move.product_uom._compute_quantity(
                         move.product_uom_qty, product.uom_id,
                         rounding_method='HALF-UP'
                     )
-                    if float_compare(
-                        total_reserved, total_demand,
-                        precision_rounding=rounding
-                    ) >= 0:
+                    if float_compare(total_reserved, total_demand, precision_rounding=rounding) >= 0:
                         move.write({'state': 'assigned'})
                     else:
                         move.write({'state': 'partially_available'})
