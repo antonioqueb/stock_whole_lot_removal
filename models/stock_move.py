@@ -45,6 +45,16 @@ class StockMove(models.Model):
 
     def _action_assign(self, force_qty=False):
         """Override to intercept moves that use whole_lot* removal strategies."""
+        # Contexto usado por integraciones que crean reservas exactas manualmente.
+        # En ese caso no debe entrar ni a WholeLot ni a la reserva estándar:
+        # la integración crea las move lines precisas después.
+        if self.env.context.get('skip_whole_lot_no_assign'):
+            _logger.info(
+                "WholeLot: SKIP assignment by context skip_whole_lot_no_assign. Moves=%s",
+                self.ids,
+            )
+            return True
+
         if self.env.context.get('skip_whole_lot_strategy'):
             return super()._action_assign(force_qty=force_qty)
 
@@ -83,7 +93,10 @@ class StockMove(models.Model):
             super(StockMove, regular_moves)._action_assign(force_qty=force_qty)
 
         if whole_lot_moves:
-            _logger.info(f"WholeLot: Processing {len(whole_lot_moves)} moves with WholeLot strategy...")
+            _logger.info(
+                "WholeLot: Processing %s moves with WholeLot strategy...",
+                len(whole_lot_moves),
+            )
             whole_lot_moves._assign_whole_lots()
 
         return True
