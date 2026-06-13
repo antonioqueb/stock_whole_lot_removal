@@ -1,0 +1,8 @@
+# Archivos ignorados
+modulo.md
+.vscode/
+.env
+__pycache__/
+*.pyc
+.DS_Store
+settings.json
