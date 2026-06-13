@@ -11,17 +11,19 @@ Estrategias de Remoción con Selección Manual Forzada
 Este módulo provee DOS estrategias de remoción para productos donde la
 selección de lotes se realiza manualmente desde la orden de venta:
 
-1) **Lotes Completos (Sin Selección Automática)** - método `whole_lot`
+1) **Lotes Completos (Sin Selección Automática)** - método ``whole_lot``
+
    - Para productos tipo PLACA donde cada lote es indivisible.
    - Nunca divide un lote para llenar parcialmente la demanda.
    - Respeta 100% la selección manual.
 
-2) **Lotes con Parcialidades (Sin Selección Automática)** - método `whole_lot_partial`
+2) **Lotes con Parcialidades (Sin Selección Automática)** - método ``whole_lot_partial``
+
    - Para productos tipo FORMATO/PIEZA donde se venden cantidades parciales
      de un mismo lote.
    - Respeta 100% la selección manual.
    - Reserva las cantidades específicas por lote definidas en el breakdown
-     de la línea de venta (`x_lot_breakdown_json`).
+     de la línea de venta (``x_lot_breakdown_json``).
    - Si un lote seleccionado no tiene cantidad explícita, usa la cantidad
      disponible completa.
 
