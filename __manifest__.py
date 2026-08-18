@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 {
     'name': 'Estrategias de Remoción - Lotes Completos y Parciales (Sin Selección Automática)',
-    'version': '19.0.2.0.0',
+    'version': '19.0.3.0.0',
     'category': 'Inventory/Inventory',
     'summary': 'Dos estrategias de remoción que respetan la selección manual de lotes: una para lotes completos (placas) y otra que permite parcialidades (formatos/piezas).',
     'description': """

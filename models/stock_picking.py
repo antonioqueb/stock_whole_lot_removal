@@ -155,16 +155,10 @@ class StockPicking(models.Model):
                     _logger.info(
                         "WholeLot: Clearing %d incorrect move_lines", len(move.move_line_ids)
                     )
-                    for ml in move.move_line_ids:
-                        ml_qty = ml.quantity if 'quantity' in ml._fields else 0.0
-                        if ml_qty > 0 and ml.lot_id:
-                            try:
-                                Quant._update_reserved_quantity(
-                                    product, move.location_id, -ml_qty,
-                                    lot_id=ml.lot_id, strict=False
-                                )
-                            except Exception:
-                                pass
+                    # El unlink de la move line libera SU reserva (Odoo 19).
+                    # La resta explícita adicional con _update_reserved_quantity
+                    # sobre el padre era el espejo de la reserva duplicada que
+                    # se eliminó: mantenerla dejaría reservas negativas.
                     move.move_line_ids.unlink()
 
                 pending_lots = self.env['stock.lot'].browse(list(pending_lot_ids)).exists()
@@ -218,50 +212,60 @@ class StockPicking(models.Model):
                     if float_compare(reserve_qty, 0, precision_rounding=rounding) <= 0:
                         continue
 
-                    if float_compare(lot_available_qty, 0, precision_rounding=rounding) > 0:
-                        try:
-                            qty_to_reserve = min(reserve_qty, lot_available_qty)
-                            Quant._update_reserved_quantity(
-                                product, move.location_id, qty_to_reserve,
-                                lot_id=lot, strict=False
-                            )
-                        except Exception as e:
-                            _logger.error("WholeLot: Failed to reserve lot %s: %s", lot.name, e)
-                            continue
-                    else:
+                    if float_compare(lot_available_qty, 0, precision_rounding=rounding) <= 0:
                         _logger.info(
                             "WholeLot: Lot %s already reserved (backorder transfer)", lot.name
                         )
 
-                    uom_qty = product.uom_id._compute_quantity(
-                        reserve_qty, move.product_uom, rounding_method='HALF-UP'
-                    )
+                    # La reserva la hace la CREACIÓN de la move line en el bin
+                    # real de cada quant. Antes: _update_reserved_quantity
+                    # sobre move.location_id (reservaba en el bin) + move line
+                    # en el PADRE (la creación volvía a reservar ahí) = reserva
+                    # DOBLE y consumo en SOM/Existencias al validar → quant
+                    # negativo en el padre con el bin intacto (doble
+                    # disponibilidad; caso testigo 20183-59).
+                    remaining = reserve_qty
+                    targets = positive_quants or quants
+                    for quant in targets:
+                        if float_compare(remaining, 0, precision_rounding=rounding) <= 0:
+                            break
+                        if positive_quants:
+                            take = min(remaining, quant.quantity or 0.0)
+                        else:
+                            # Transferencia de backorder: el material viaja
+                            # reservado por la cadena; la línea se re-crea
+                            # completa en la ubicación del quant.
+                            take = remaining
+                        if float_compare(take, 0, precision_rounding=rounding) <= 0:
+                            continue
 
-                    ml_vals = {
-                        'move_id': move.id,
-                        'product_id': product.id,
-                        'product_uom_id': move.product_uom.id,
-                        'location_id': move.location_id.id,
-                        'location_dest_id': move.location_dest_id.id,
-                        'lot_id': lot.id,
-                        'lot_name': lot.name,
-                        'picking_id': bo_picking.id,
-                        'company_id': move.company_id.id or self.env.company.id,
-                    }
+                        uom_qty = product.uom_id._compute_quantity(
+                            take, move.product_uom, rounding_method='HALF-UP'
+                        )
+                        ml_vals = {
+                            'move_id': move.id,
+                            'product_id': product.id,
+                            'product_uom_id': move.product_uom.id,
+                            'location_id': quant.location_id.id,
+                            'location_dest_id': move.location_dest_id.id,
+                            'lot_id': lot.id,
+                            'lot_name': lot.name,
+                            'picking_id': bo_picking.id,
+                            'company_id': move.company_id.id or self.env.company.id,
+                        }
+                        if 'reserved_uom_qty' in self.env['stock.move.line']._fields:
+                            ml_vals['reserved_uom_qty'] = uom_qty
+                        else:
+                            ml_vals['quantity'] = uom_qty
+                        if quant.package_id:
+                            ml_vals['package_id'] = quant.package_id.id
+                        if quant.owner_id:
+                            ml_vals['owner_id'] = quant.owner_id.id
 
-                    if 'reserved_uom_qty' in self.env['stock.move.line']._fields:
-                        ml_vals['reserved_uom_qty'] = uom_qty
-                    else:
-                        ml_vals['quantity'] = uom_qty
+                        self.env['stock.move.line'].create(ml_vals)
+                        remaining -= take
 
-                    first_quant = quants[0]
-                    if first_quant.package_id:
-                        ml_vals['package_id'] = first_quant.package_id.id
-                    if first_quant.owner_id:
-                        ml_vals['owner_id'] = first_quant.owner_id.id
-
-                    self.env['stock.move.line'].create(ml_vals)
-                    total_reserved += reserve_qty
+                    total_reserved += reserve_qty - max(remaining, 0.0)
 
                     _logger.info(
                         "WholeLot[%s]: SUCCESS - Assigned lot '%s' (%.2f %s) to backorder %s",

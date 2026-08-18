@@ -400,54 +400,85 @@ class StockMove(models.Model):
     # ═══════════════════════════════════════════════════════════════════════════
 
     def _do_reserve_lot(self, move, lot, qty, product, rounding):
-        """Reserva `qty` del `lot` y crea el move_line. Returns: cantidad reservada."""
+        """Reserva `qty` del `lot` creando move lines EN EL BIN real de cada
+        quant. Returns: cantidad reservada.
+
+        DEFECTO CORREGIDO (caso testigo 20183-59 / V/071 / V/107 / V/259):
+        antes se reservaba explícitamente con _update_reserved_quantity en
+        move.location_id (strict=False reserva en el quant del BIN) y luego
+        la move line se creaba con location_id = move.location_id (el
+        PADRE, SOM/Existencias). En Odoo 19 la creación de la move line
+        vuelve a reservar en SU ubicación exacta, así que quedaba reserva
+        DOBLE (bin + padre, origen del 'reservado 240 vs 100') y el consumo
+        al validar pegaba en el PADRE: quant negativo en SOM/Existencias
+        con el bin intacto — la placa se ofrecía y vendía dos veces.
+
+        Ahora: se parte la cantidad entre los quants con disponible y cada
+        move line nace en la ubicación del quant; la reserva la hace la
+        propia creación de la línea (una sola vez, en el bin correcto)."""
         Quant = self.env['stock.quant']
 
         try:
-            reserved_before = sum(
-                q.reserved_quantity
-                for q in Quant._gather(product, move.location_id, lot_id=lot, strict=False)
-            )
+            quants = Quant._gather(
+                product, move.location_id, lot_id=lot, strict=False)
 
-            Quant._update_reserved_quantity(
-                product, move.location_id, qty, lot_id=lot, strict=False
-            )
+            total_reserved = 0.0
+            remaining = qty
 
-            reserved_after = sum(
-                q.reserved_quantity
-                for q in Quant._gather(product, move.location_id, lot_id=lot, strict=False)
-            )
+            for quant in quants:
+                if float_compare(remaining, 0, precision_rounding=rounding) <= 0:
+                    break
+                available = (quant.quantity or 0.0) - (quant.reserved_quantity or 0.0)
+                if float_compare(available, 0, precision_rounding=rounding) <= 0:
+                    continue
+                take = min(remaining, available)
+                self._create_whole_lot_move_line(
+                    move, lot, take, product, quant=quant)
+                total_reserved += take
+                remaining -= take
 
-            actual_reserved = reserved_after - reserved_before
-
-            if float_compare(actual_reserved, 0, precision_rounding=rounding) > 0:
-                self._create_whole_lot_move_line(move, lot, actual_reserved, product)
+            if float_compare(total_reserved, 0, precision_rounding=rounding) > 0:
                 _logger.info(
                     "WholeLot: SUCCESS - Reserved lot '%s' (%.2f %s)",
-                    lot.name, actual_reserved, product.uom_id.name
+                    lot.name, total_reserved, product.uom_id.name
                 )
-                return actual_reserved
             else:
                 _logger.warning(
                     "WholeLot: FAILED - Reservation had no effect for lot '%s'.", lot.name
                 )
-                return 0.0
+            return total_reserved
         except Exception as e:
             _logger.error("WholeLot: EXCEPTION reserving lot '%s': %s",
                           lot.name if lot else 'N/A', str(e))
             return 0.0
 
-    def _create_whole_lot_move_line(self, move, lot, quantity, product):
-        """Create a stock.move.line for a whole-lot reservation."""
+    def _create_whole_lot_move_line(self, move, lot, quantity, product, quant=None):
+        """Create a stock.move.line for a whole-lot reservation.
+
+        La línea nace en la ubicación del QUANT (el bin real), no en
+        move.location_id: con el padre, el consumo al validar dejaba
+        negativo en SOM/Existencias y el bin intacto (doble
+        disponibilidad)."""
         uom_qty = product.uom_id._compute_quantity(
             quantity, move.product_uom, rounding_method='HALF-UP'
+        )
+
+        if quant is None:
+            gathered = self.env['stock.quant']._gather(
+                product, move.location_id, lot_id=lot, strict=False
+            )
+            positive = gathered.filtered(lambda q: (q.quantity or 0.0) > 0)
+            quant = (positive or gathered)[:1] or None
+
+        source_location_id = (
+            quant.location_id.id if quant else move.location_id.id
         )
 
         vals = {
             'move_id': move.id,
             'product_id': product.id,
             'product_uom_id': move.product_uom.id,
-            'location_id': move.location_id.id,
+            'location_id': source_location_id,
             'location_dest_id': move.location_dest_id.id,
             'lot_id': lot.id if lot else False,
             'lot_name': lot.name if lot else False,
@@ -462,14 +493,10 @@ class StockMove(models.Model):
         if move.picking_id:
             vals['picking_id'] = move.picking_id.id
 
-        quants = self.env['stock.quant']._gather(
-            product, move.location_id, lot_id=lot, strict=False
-        )
-        if quants:
-            first_quant = quants[0]
-            if first_quant.package_id:
-                vals['package_id'] = first_quant.package_id.id
-            if first_quant.owner_id:
-                vals['owner_id'] = first_quant.owner_id.id
+        if quant:
+            if quant.package_id:
+                vals['package_id'] = quant.package_id.id
+            if quant.owner_id:
+                vals['owner_id'] = quant.owner_id.id
 
         return self.env['stock.move.line'].create(vals)
