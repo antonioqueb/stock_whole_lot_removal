@@ -251,7 +251,8 @@ class StockPicking(models.Model):
                             'lot_id': lot.id,
                             'lot_name': lot.name,
                             'picking_id': bo_picking.id,
-                            'company_id': move.company_id.id or self.env.company.id,
+                            # compañía del MOVIMIENTO (jamás la activa del usuario)
+                            'company_id': (move.company_id or bo_picking.company_id).id,
                         }
                         if 'reserved_uom_qty' in self.env['stock.move.line']._fields:
                             ml_vals['reserved_uom_qty'] = uom_qty

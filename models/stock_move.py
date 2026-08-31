@@ -482,7 +482,8 @@ class StockMove(models.Model):
             'location_dest_id': move.location_dest_id.id,
             'lot_id': lot.id if lot else False,
             'lot_name': lot.name if lot else False,
-            'company_id': move.company_id.id or self.env.company.id,
+            # compañía del MOVIMIENTO (jamás la activa del usuario)
+            'company_id': (move.company_id or move.picking_id.company_id).id,
         }
 
         if 'reserved_uom_qty' in self.env['stock.move.line']._fields:
