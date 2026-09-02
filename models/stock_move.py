@@ -270,6 +270,30 @@ class StockMove(models.Model):
                 )
                 continue
 
+            # CANDADO DE EMBARQUE (caso 21232-6 / EMBARQUE/2026/0077): una
+            # recepción física ligada a un viaje —directa o backorder— solo
+            # puede tomar lotes de ESE viaje. La "selección abierta" de abajo
+            # tomaba cualquier lote del producto estacionado en tránsito
+            # (p.ej. una devolución de cliente mal enrutada). Sin lotes del
+            # viaje: NO se reserva material ajeno, se avisa y se espera.
+            voyage = (move._tc_reception_voyage()
+                      if hasattr(move, '_tc_reception_voyage') else False)
+            if voyage:
+                voyage_lot_ids = set(move._tc_voyage_allowed_lots(voyage).ids)
+                available_lots = [
+                    d for d in available_lots if d['lot_id'].id in voyage_lot_ids]
+                if not available_lots:
+                    _logger.warning(
+                        "WholeLot: [EMBARQUE %s] sin lotes de %s en el viaje; "
+                        "no se reserva material ajeno en tránsito.",
+                        voyage.name, product.display_name)
+                    if move.picking_id and hasattr(move.picking_id, '_tc_notify_voyage_lot_guard'):
+                        move.picking_id._tc_notify_voyage_lot_guard(voyage, product)
+                    continue
+                _logger.info(
+                    "WholeLot: [EMBARQUE %s] candidatos acotados a %d lote(s) del viaje",
+                    voyage.name, len(available_lots))
+
             sol = move.sale_line_id
             selection = self._get_sol_lot_selection(sol)
             already_delivered_ids = self._get_already_delivered_lot_ids(sol) if sol else set()
